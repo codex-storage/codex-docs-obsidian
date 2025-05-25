@@ -1,0 +1,42 @@
+{
+  "excludePatterns": "",
+  "useCustomPattern": false,
+  "highlightPattern": "==\\s*(.*?)\\s*==|<mark[^>]*>(.*?)</mark>|<span[^>]*>(.*?)</span>",
+  "defaultHighlightColor": "#ffeb3b",
+  "ai": {
+    "provider": "ollama",
+    "ollama": {
+      "host": "http://localhost:11434",
+      "model": ""
+    },
+    "gemini": {
+      "apiKey": "",
+      "model": "gemini-pro",
+      "baseUrl": "",
+      "isCustomModel": false
+    },
+    "openai": {
+      "apiKey": "",
+      "model": "gpt-4o",
+      "baseUrl": ""
+    },
+    "anthropic": {
+      "apiKey": "",
+      "model": "claude-2",
+      "apiAddress": "",
+      "isCustomModel": false,
+      "lastCustomModel": ""
+    },
+    "deepseek": {
+      "apiKey": "",
+      "model": "deepseek-chat",
+      "baseUrl": ""
+    },
+    "prompts": {
+      "🤔 Key Insight": "{{highlight}}.Please reinterpret the above content from a fresh perspective and summarize its core idea within 200 characters."
+    }
+  },
+  "export": {
+    "exportPath": "90 Extras/HiNote"
+  }
+}
