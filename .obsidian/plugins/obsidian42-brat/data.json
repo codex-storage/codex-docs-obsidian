@@ -1,5 +1,6 @@
 {
   "pluginList": [
+    "Fevol/obsidian-criticmarkup",
     "reply2za/obsidian-query-control"
   ],
   "pluginSubListFrozenVersion": [],
