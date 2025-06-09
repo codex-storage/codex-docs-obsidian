@@ -1,3 +1,4 @@
+[![hackmd-github-sync-badge](https://hackmd.io/onqV1RP7R9KOkYpx_iRuzQ/badge)](https://hackmd.io/onqV1RP7R9KOkYpx_iRuzQ)
 So here is a piece of code (test):
 
 ```nim
