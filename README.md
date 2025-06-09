@@ -6,7 +6,7 @@ all Codex-related docs.
 Some featured documents:
 
 - [[Code Encryption Basis]]
-- [[How to build Codex on Ubuntu 24 (VM)?]]
+- [[How to build Codex on Ubuntu 24 (VM)]]
 - [[Compilation error when using `auto` types and Questionable]]
 
 ### Obsidian

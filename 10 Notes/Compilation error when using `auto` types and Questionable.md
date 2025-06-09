@@ -14,7 +14,7 @@ test "Should retrieve block expiration information":
 	# ...
 ```
 
-Compiling this on Ubuntu (see also [[How to build Codex on Ubuntu 24 (VM)?]]) fails with the following error:
+Compiling this on Ubuntu (see also [[How to build Codex on Ubuntu 24 (VM)]]) fails with the following error:
 
 ```bash
 stack trace: (most recent call last)
