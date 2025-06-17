@@ -1,10 +1,10 @@
-[![hackmd-github-sync-badge](https://hackmd.io/Nyj8Hp16SHu79OegS9GMqQ/badge)](https://hackmd.io/Nyj8Hp16SHu79OegS9GMqQ)
 
-I am using Parallels Desktop. 
+I am using Parallels Desktop.
 
-In order to be able to compile I needed to increase the amount of RAM available to my VM. Default was `2048 MB` which was too little - VM was hanging and/or the build process crashed (`killed`). I set it to `8192 MB`:
+In order to be able to compile I needed to increase ==the amount of RAM available== to my VM. Default was `2048 MB` which was too little - VM was hanging and/or the build process crashed (`killed`). I set it to `8192 MB`:
 
 ### GCC
+
 We are currently using GCC-14. What you have on your Ubuntu is most probably GCC-13. So first to install GCC-14:
 
 ```bash
