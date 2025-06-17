@@ -1,4 +1,9 @@
-We want some kind of encryption of user data, definitely on by default (maybe even enforced in all cases). ^comment-1
+---
+related-to:
+  - "[[Codex Encryption Design]]"
+  - "[[Codex Encryption Implementation]]"
+---
+We want some kind of encryption of user data, definitely on by default (maybe even enforced in all cases).
 
 Some observations:
 

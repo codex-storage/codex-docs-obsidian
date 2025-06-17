@@ -5,7 +5,7 @@ all Codex-related docs.
 
 Some featured documents:
 
-- [[Code Encryption Basis]]
+- [[Codex Encryption Basis]]
 - [[How to build Codex on Ubuntu 24 (VM)]]
 - [[Compilation error when using `auto` types and Questionable]]
 
