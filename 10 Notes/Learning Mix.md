@@ -15,6 +15,9 @@
 				- or use the web-version of the Obsidian vault:
 					- https://logos-storage.github.io/logos-storage-docs-obsidian/10-notes/sphinx-header-processing-example
 					- https://publish.obsidian.md/logos-storage/10+Notes/Sphinx+Header+Processing+Example
+		- Path selection strategies
+			- When Mixnets Fail: Evaluating, Quantifying, and Mitigating the Impact of Adversarial Nodes in Mix Networks
+				- https://www.ndss-symposium.org/wp-content/uploads/2026-f2384-paper.pdf
 - MIX IMPLEMENTATION:
 	- Main Mix Repo: https://github.com/logos-co/nim-libp2p-mix
 	- Examples:

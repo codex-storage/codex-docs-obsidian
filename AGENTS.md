@@ -88,3 +88,12 @@ python3 -m http.server 8080 --directory "/tmp/opencode/<build>/quartz/public"
 
 - During this session, unrelated local modifications were observed in `.obsidian/appearance.json` and `10 Notes/Sphinx Header Processing Example.md`.
 - Do not revert or stage those files unless explicitly requested.
+
+## Current Session State
+
+- The user visually checked the latest local Quartz build and said the SVG rendering looks good.
+- The latest verified local build was under `/tmp/opencode/quartz-build.Cy3CNu/quartz/public`; if rebuilding, use a fresh `/tmp/opencode` build directory rather than relying on that path existing.
+- Intended repo changes from this Quartz work include `.github/workflows/deploy.yml`, `.quartz/quartz.config.yaml`, `.quartz/custom.scss`, `.quartz/patch-crawl-links-object-data.mjs`, and `AGENTS.md`.
+- SVG embeds currently render as `<object type="image/svg+xml">`, so clicking the diagram itself does not open the raw SVG as a separate file.
+- Possible future improvement for SVG click-through is to add a small explicit `Open SVG` link near SVG embeds or an overlay link; wrapping `<object>` directly in `<a>` may be inconsistent because embedded SVG documents can capture pointer events.
+- The current choice is to leave SVG opening as-is unless the user asks to implement separate-file links.
