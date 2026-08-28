@@ -42,12 +42,22 @@ jobs:
       - name: Configure Quartz
         run: |
           cp .quartz/quartz.config.yaml quartz/quartz.config.yaml
+          cp .quartz/quartz.lock.json quartz/quartz.lock.json
           cp .quartz/custom.scss quartz/quartz/styles/custom.scss
 
       - name: Install Quartz plugins
         run: |
           cd quartz
-          npx quartz plugin install
+          npx quartz plugin install --clean
+
+      # The pinned syntax-highlighting plugin declares Shiki as a peer
+      # dependency but does not install it for the plugin's isolated build.
+      - name: Repair syntax-highlighting dependency
+        run: |
+          cd quartz
+          npm --prefix .quartz/plugins/syntax-highlighting install \
+            --no-save --package-lock=false shiki@4.4.3
+          npm --prefix .quartz/plugins/syntax-highlighting run build
 
       - name: Patch Quartz SVG asset links
         run: |

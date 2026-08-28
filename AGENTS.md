@@ -5,6 +5,8 @@
 - This vault is deployed to GitHub Pages with Quartz v5.
 - GitHub Pages URL: `https://logos-storage.github.io/logos-storage-docs-obsidian/`.
 - The workflow clones Quartz from `jackyzha0/quartz` branch `v5` and copies committed config from `.quartz/` into the cloned Quartz checkout.
+- `.quartz/quartz.lock.json` pins the community plugin revisions. The workflow copies the lock file into the Quartz checkout and restores plugins with `npx quartz plugin install --clean`.
+- The pinned `syntax-highlighting` plugin declares Shiki as a peer dependency but does not install it for its isolated build. The workflow installs the exact `shiki@4.4.3` dependency in that plugin and rebuilds it after the general plugin restore. Remove this repair when the pinned plugin revision no longer needs it.
 - Keep Quartz config explicit in this repo under `.quartz/`; avoid dynamic CI patching unless there is a concrete reason.
 - The workflow applies `.quartz/patch-crawl-links-object-data.mjs` after `npx quartz plugin install` because the current `quartz-community/crawl-links` plugin resolves `img[src]` but not SVG embed `object[data]` URLs.
 - The crawl-links patch makes basename SVG embeds such as `![[diagram.svg]]` resolve to emitted asset paths like `../90-extras/92-assets/diagram.svg` instead of broken note-relative URLs.
