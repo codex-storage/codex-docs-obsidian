@@ -12,7 +12,6 @@ related:
   - "[[Libp2p Connection Lifecycle in Logos Storage]]"
   - "[[New Logos Storage Discovery]]"
 ---
-
 # Block Exchange Peer Stores
 
 > [!info] Source baseline
