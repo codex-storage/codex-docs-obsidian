@@ -3,8 +3,6 @@ related:
   - "[[Mix Transport Design Specification]]"
 ---
 
-# Mix Transport Implementation Walk Through
-
 - [[Mix Transport Implementation Walk Through - Wire Format Foundation]]
 - [[Mix Transport Implementation Walk Through - Reply Credential Store]]
 - [[Mix Transport Implementation Walk Through - Session Registry]]

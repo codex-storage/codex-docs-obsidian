@@ -5,9 +5,6 @@ related:
   - "[[Mix Transport Implementation Walk Through - Application Connection and Protocol Dispatch]]"
   - "[[Mix Transport Implementation Walk Through - Reply Credential Store]]"
 ---
-
-# Mix Transport Implementation Walk Through - Bounded Data Flow
-
 This walkthrough follows application bytes through an established `TransportStream`. The forward path begins when the session initiator writes to the stream, divides the byte sequence into Sphinx-sized transport frames and sends those frames to the session recipient. The recipient restores the ordered byte stream, exposes the bytes to the mounted libp2p protocol and acknowledges the received sequences. The walkthrough then follows the reverse path, where the recipient sends Data and ACK frames through SURB groups supplied by the initiator. Because every reverse frame consumes one group, the recipient must replenish that supply before it loses its final return path.
 
 The implementation is divided across four modules:

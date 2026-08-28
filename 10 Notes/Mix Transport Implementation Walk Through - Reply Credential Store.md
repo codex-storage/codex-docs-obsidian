@@ -4,9 +4,6 @@ related:
   - "[[Mix Transport Design Specification]]"
   - "[[Mix Transport Implementation Walk Through - Wire Format Foundation]]"
 ---
-
-# Mix Transport Implementation Walk Through - Reply Credential Store
-
 This phase adds the initiator-side state needed to receive replies through SURBs and connects it to `MixTransport.handleRawSurbReply`. The store is now used by the `Connect` handshake described in [[Mix Transport Implementation Walk Through - Connect Handshake]].
 
 The implementation is in `libp2p_mix_transport/reply_credentials.nim`, with focused tests in `tests/test_reply_credentials.nim`.

@@ -4,9 +4,6 @@ related:
   - "[[Mix Transport Design Specification]]"
   - "[[Mix Transport Implementation Walk Through - Reply Credential Store]]"
 ---
-
-# Mix Transport Implementation Walk Through - Session Registry
-
 This note describes the transport-owned registry used by the implemented `Connect` handshake, stream registry, received-SURB supply and refill state. `SessionStore` provides both the frame-routing lookup by pseudonym and the `connect(destination)` reuse lookup by real destination.
 
 The implementation is in `libp2p_mix_transport/sessions.nim`. Its focused tests are in `tests/test_sessions.nim`.

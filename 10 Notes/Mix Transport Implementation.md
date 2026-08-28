@@ -48,155 +48,114 @@ link: https://hackmd.io/i6vSY7gPTRqwn4XtVjIrmg
 - requester receives the block,
 - etc...
 
-We have a bunch of documents forming an overview of the block exchange protocol. To form some practical strategy for Mix Transport implementation here are the most importants excerpts from those document.
+### Initializing Mix Protocol
 
+`StorageServer.start` already provides conditional Mix Protocol initialization for the purpose of DHT queries over Mix. More specifically, `config.mixEnabled`, `config.mixPoolJson`, and `config.mixPool` can be reused also for blocks exchange protocol.
 
-## What the libp2p connection manager stores
+At the end of the `if s.config.mixEnabled:` code path, `mixProto` holds fully initialized instance of the `MixProtocol`. This is the right moment create an instance of the `MixTransport`, passing `mixProto` as a constructor argument. We set the instance of the `MixTransport` as optional on the `BlockExcNetwork.mixTransport`. If it is set, it means that Mix is enabled and should be used to carry the block exchange and manifest protocols.
 
-After an incoming or outgoing transport is connected, secured, and upgraded, libp2p stores its muxer in `ConnManager.muxerStore`.
+Initially I thought that `MixTransport` will not be another libp2p protocol on its own, but because of how current Mix implementation works this may be the easiest if not the only option. Mix implementation always needs to send the data to a concrete protocol: if one is not mounted on the `Switch`, we will get an error:
 
-The connection manager:
-
-- indexes muxers by `PeerId`;
-- tracks incoming and outgoing direction;
-- prefers an outgoing muxer when selecting a connection, then falls back to an incoming muxer;
-- opens new Yamux streams through the selected muxer;
-- emits `ConnEvent.Connected` for every new muxed transport connection;
-- emits `PeerEvent.Joined` only when the first connection for a peer is stored;
-- watches the underlying connection for closure;
-- emits `PeerEvent.Left` only when the last connection for that peer has disappeared.
-
-Consequently, closing one application stream is not a peer departure. Even closing one of two physical connections is not a peer departure if another muxer for that peer remains.
-
-
-## How outgoing peer connections are created
-
-### Provider discovery for block exchange
-
-The download worker asks `DiscoveryEngine` to find providers for the **manifest CID**. Direct provider lookup uses Discv5; it is not itself a libp2p stream.
-
-For every returned signed peer record, `DiscoveryEngine.discoveryTaskLoop` calls:
+**libp2p_mix/exit_layer.nim:**
 
 ```nim
-BlockExcNetwork.dialPeer(peerRecord)
+var hasHandler: bool = false
+for index, handler in enumerate(self.switch.ms.handlers):
+  if codec in handler.protos:
+	try:
+	  hasHandler = true
+	  await handler.protocol.handler(exitConn, codec)
+	except CatchableError as e:
+	  error "Error during execution of MixProtocol handler: ", err = e.msg
+
+if not hasHandler:
+  error "Handler doesn't exist", codec = codec
+  return
 ```
 
-`dialPeer`:
+Thus, `MixTransport` will be having its own protocol - `MixTransportProtocol`. 
 
-1. skips the local peer ID;
-2. skips a peer already present in `BlockExcNetwork.peers`;
-3. calls `switch.connect(peerId, addresses)`.
-
-`switch.connect` establishes or reuses a transport connection but deliberately does **not** negotiate an application protocol stream. With the default `reuseConnection = true`, the libp2p dialer returns immediately when a usable muxer for that peer already exists.
+We add the MixTransport initialization code to `storage/storage.nim`, in `StorageServer.start` under the `s.config.mixEnabled` code path where we initialize Mix Transport passing the already initialized instance of `MixProtocol` to it:
 
 ```nim
-proc dialPeer*(self: BlockExcNetwork, peer: PeerRecord) {.async.} =
-  if self.isSelf(peer.peerId):
-    trace "Skipping dialing self", peer = peer.peerId
+proc startMixTransport*(s: StorageServer, mixProto: MixProtocol) {.async: (raises: [CancelledError, StorageError]).} =
+  if not s.config.mixEnabled or mixProto.isNil:
     return
 
-  if peer.peerId in self.peers:
-    trace "Already connected to peer", peer = peer.peerId
-    return
+  let switch = s.storageNode.switch
 
-  await self.switch.connect(peer.peerId, peer.addresses.mapIt(it.address))
+  let mixTransport = newMixTransport(switch, mixProto)
+  (await mixTransport.start()).isOkOr:
+    raise newException(StorageError, "Failed to start Mix transport: " & error.msg)
+  s.storageNode.engine.network.mixTransport = some(mixTransport)
 ```
 
-Once a new muxer is stored, `PeerEvent.Joined` reaches `BlockExcNetwork.handlePeerJoined`. That creates the per-peer block-exchange objects before any block-exchange stream is necessarily open.
-
-### Manifest fetching
-
-Manifest fetching does not pre-connect through `BlockExcNetwork`. It directly calls:
+As we see, it also sets the  `mixTransport` optional on the instance of `BlockExcNetwork`, which is defined as:
 
 ```nim
-switch.dial(peerId, addresses, "/storage/manifest/1.0.0")
+mixTransport*: Option[MixTransport] = none(MixTransport)
 ```
 
-This combined form:
+With this, the `BlockExcNetwork` can easily detect if Mix is enabled.
 
-1. reuses an existing muxer when possible;
-2. otherwise establishes, secures, and stores a new peer connection;
-3. opens a new Yamux stream;
-4. negotiates the manifest codec on that stream.
+### Initiating outgoing connections
 
-### Opening a block-exchange stream
+The party that wants to connect to other peers anonymously, will naturally avoid using the libp2p-level `Switch.connect` or `Switch.dial` operation: these are irrelevant in the Mix environment as connecting to a remote peer using a direct libp2p connection would de-anonymize the original sender. Yet, before adding the discovered provider to list of peer, it might be desired to established an anonymous connection with the discovered provider in order to confirm that this peer is reachable before attempting regular block exchange traffic with that peer.
 
-The switch-level connection may sit without a block-exchange stream until the first message needs to be sent.
+To facilitate this, `MixTransport` provides its own `connect` operation. `connect` will attempt an anonymous round-trip exchange with the remote peer, sending it a number of SURBs that fit within a single Sphynx block. The remote provider will use some of these SURBs to acknowledge its reachability.
 
-`NetworkPeer.connect` checks `sendConn`:
+> To remote provider will use a number of SURBs to establish some redundancy in order to 
+> increase the chance that at least one packet arrives at the original sender.
 
-```text
-sendConn exists and is neither closed nor at EOF
-  -> return the existing stream
+This initial exchange will be of a simple request-response type, using the default Mix protocol implementation.
 
-otherwise
-  -> switch.dial(peerId, "/storage/blockexc/1.0.0")
-  -> store the returned stream in sendConn
-  -> start a readLoop on it
-```
+After successful exchange, the originating `peerId` can be added to the list of network peers in the same way as it is done for the regular block exchange protocol.
 
-This is a lazy, protocol-stream connection step. Because provider discovery has normally already called `switch.connect`, the codec-only `switch.dial` opens a stream over an existing muxer.
+Recall there are two local stores keeping track of the `peerId`: one on the network level and one on the engine level. Both are normally populated in response to the `PeerEventKind.Joined` event handlers. Correspondingly, a peer is normally removed from the stores in response to the `PeerEventKind.Left` event. Explicit removal via `BlockExcNetwork.dropPeer` delegates to the switch, which in turn which cause the `PeerEventKind.Left` event to be triggered. 
+
+We mention it here as it will be important to properly manege the `peerId` lifecycle also in the Mix Transport as the original  `PeerEventKind.Joined` and `PeerEventKind.Left` will not be triggered in this case (see also `excludedPeers: HashSet[PeerId]` property on `BlockExcNetwork`).
+
+For the peer initiating the connection (the original sender in the Mix terms), the very first connection to the remote provider will be caused by the `discoveryTaskLoop`, where for each discovered `peerId` that advertises the given CID
 
 ```nim
-proc connect*(
-    self: NetworkPeer
-): Future[Connection] {.async: (raises: [CancelledError]).} =
-  if self.connected:
-    trace "Already connected", peer = self.id, connId = self.sendConn.oid
-    return self.sendConn
+  proc discoveryTaskLoop(b: DiscoveryEngine) {.async: (raises: []).} =
+    ## Run discovery tasks
+    ## Peer availability is tracked per-download in DownloadContext.swarm.
+    ## This loop just runs discovery for CIDs that are queued.
 
-  self.sendConn = await self.getConn()
-  self.trackedFutures.track(self.readLoop(self.sendConn))
-  return self.sendConn
+    try:
+      while b.discEngineRunning:
+        let cid = await b.discoveryQueue.get()
+
+        if cid in b.inFlightDiscReqs:
+          trace "Discovery request already in progress", cid
+          continue
+
+        trace "Running discovery task for cid", cid
+
+        let request = b.discovery.find(cid)
+        b.inFlightDiscReqs[cid] = request
+        storage_inflight_discovery.set(b.inFlightDiscReqs.len.int64)
+
+        defer:
+          b.inFlightDiscReqs.del(cid)
+          storage_inflight_discovery.set(b.inFlightDiscReqs.len.int64)
+
+        if (await request.withTimeout(DefaultDiscoveryTimeout)) and
+            peers =? (await request).catch:
+          let dialed = await allFinished(peers.mapIt(b.network.dialPeer(it.data)))
+
+          for i, f in dialed:
+            if f.failed:
+              await b.discovery.removeProvider(peers[i].data.peerId)
+    except CancelledError:
+      trace "Discovery task cancelled"
+      return
+
+    info "Exiting discovery task runner"
+
 ```
 
-## Incoming connection and stream creation
+### Processing Incoming Frames
 
-For an incoming transport connection, the switch:
-
-1. accepts TCP;
-2. performs the secure and multiplexing upgrade;
-3. stores the muxer in the connection manager;
-4. identifies the peer;
-5. emits peer events;
-6. accepts negotiated streams from that muxer.
-
-When the remote peer opens `/storage/blockexc/1.0.0`, the protocol handler:
-
-1. reads `conn.peerId`;
-2. obtains or creates the shared `NetworkPeer`;
-3. runs `NetworkPeer.readLoop(conn)` for the lifetime of that stream.
-
-An incoming block-exchange stream is not assigned to `NetworkPeer.sendConn`. If the local node later needs an outgoing retained stream, it may open another block-exchange stream over the same muxer. The protocol is bidirectional at the framing level, but the implementation specifically retains the lazily opened outgoing stream as `sendConn`.
-
-When the remote peer opens `/storage/manifest/1.0.0`, the manifest handler reads one CID, writes one `Found` or `NotFound` response, and returns. The libp2p multistream wrapper closes the stream after the protocol handler returns.
-
-The block-exchange incoming-stream mapping is installed by
-`BlockExcNetwork.init`:
-
-```nim
-proc handler(
-    conn: Connection, proto: string
-): Future[void] {.async: (raises: [CancelledError]).} =
-  let peerId = conn.peerId
-  let blockexcPeer = self.getOrCreatePeer(peerId)
-  await blockexcPeer.readLoop(conn) # attach read loop
-
-self.handler = handler
-```
-
-### Read Loop
-
-The pending table is per `NetworkPeer`, not per stream. Therefore, if multiple read loops exist for the same peer, exit of any one of them currently fails all pending block requests for that peer. This is an implementation detail worth preserving or reconsidering when changing the transport abstraction.
-
-### Send failure and reconnection
-
-This whole section is relevant.
-
-If a Protobuf write fails, `NetworkPeer.send` clears `sendConn` when it still refers to the failed stream and raises `LPStreamError`.
-
-If a block request cannot be written or its stream ends, the pending request is removed or completed with an error. The download engine requeues work according to its failure and retry rules.
-
-The next send calls `NetworkPeer.connect` again. If the peer's Yamux connection is still usable, this opens a replacement block-exchange stream over it. If the underlying peer connection has gone away, peer-departure cleanup removes the `NetworkPeer`, and later provider discovery may reconnect the peer from its signed addresses.
-
-There is no explicit periodic reconnect task associated with `NetworkPeer`. 
+The Mix Transport protocol helper will use the provided libp2p `Connection` object to read the incoming frames, process them (asynchronously) write back to it using the `sessionId` that we will use as the Mix Transport equivelnt of the regular connection's `peerId`.

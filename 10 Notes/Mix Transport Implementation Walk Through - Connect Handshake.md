@@ -6,9 +6,6 @@ related:
   - "[[Mix Transport Implementation Walk Through - Reply Credential Store]]"
   - "[[Mix Transport Implementation Walk Through - Session Registry]]"
 ---
-
-# Mix Transport Implementation Walk Through - Connect Handshake
-
 This phase implements the first complete exchange between two MixTransport endpoints. The initiator sends `Connect` anonymously through the Mix network, the recipient replies through a SURB supplied in that frame, and the initiator establishes the session only after recovering a valid `ConnectAck`.
 
 The transport implementation is in `libp2p_mix_transport/transport.nim`. Session-owned received SURBs are stored by `libp2p_mix_transport/sessions.nim`, and session-specific credential cleanup is implemented in `libp2p_mix_transport/reply_credentials.nim`. The end-to-end exchange is exercised by `tests/test_connect.nim`.

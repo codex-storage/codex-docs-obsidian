@@ -6,9 +6,6 @@ related:
   - "[[Mix Transport Implementation Walk Through - Virtual Stream Registry]]"
   - "[[Mix Transport Implementation Walk Through - Reply Credential Store]]"
 ---
-
-# Mix Transport Implementation Walk Through - Stream Establishment Round Trip
-
 This phase implements the first complete virtual-stream handshake over a live Mix network. The initiator calls `MixTransport.dial(destination, codec)`. The call returns an established `TransportStream` only after the destination has registered a matching inbound stream and returned `StreamAck` anonymously through a SURB.
 
 The established `TransportStream` is also the libp2p `Connection` passed to the mounted application handler. After this handshake succeeds, the configured stream can transfer Data and ACK frames as described in [[Mix Transport Implementation Walk Through - Bounded Data Flow]]. This note concentrates on the control round trip that decides whether that connection may exist.

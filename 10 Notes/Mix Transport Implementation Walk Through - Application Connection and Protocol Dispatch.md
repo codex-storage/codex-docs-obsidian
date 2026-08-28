@@ -5,9 +5,6 @@ related:
   - "[[Mix Transport Implementation Walk Through - Stream Establishment Round Trip]]"
   - "[[Mix Transport Implementation Walk Through - Bounded Data Flow]]"
 ---
-
-# Mix Transport Implementation Walk Through - Application Connection and Protocol Dispatch
-
 This phase turns each established `TransportStream` into the libp2p connection object used by an application protocol. When the recipient accepts `OpenStream`, MixTransport now passes that same stream object to the handler of the mounted protocol selected by the frame's codec. The handler can therefore use the ordinary libp2p `Stream` and `Connection` interface rather than a Mix-specific callback API.
 
 The connection is now active in both directions. `TransportStream.write` delegates to MixTransport's chunking and send path, while the stream's delivery task feeds ordered incoming Data into the inherited `BufferStream`. This note concentrates on the application-facing connection and protocol dispatch; [[Mix Transport Implementation Walk Through - Bounded Data Flow]] follows the byte and acknowledgement paths in detail.

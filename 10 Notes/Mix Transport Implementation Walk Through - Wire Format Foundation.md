@@ -5,9 +5,6 @@ related:
   - "[[Mix Transport - Pluggable Integration Model]]"
   - "[[Mix Transport Implementation Walk Through - Bounded Data Flow]]"
 ---
-
-# Mix Transport Implementation Walk Through - Wire Format Foundation
-
 `libp2p_mix_transport/wire.nim` defines the Protobuf envelope exchanged by two MixTransport endpoints. The file is not merely a collection of data types: it is the boundary that rejects malformed combinations of fields before transport state is changed, converts public SURBs through Mix's canonical serialization API and calculates how much application data fits in one Sphinx packet.
 
 The tests are in `tests/test_wire.nim`. Package users obtain these public types through the root `libp2p_mix_transport.nim` facade.

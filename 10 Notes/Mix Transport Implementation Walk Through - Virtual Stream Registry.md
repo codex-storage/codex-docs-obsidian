@@ -5,9 +5,6 @@ related:
   - "[[Mix Transport Implementation Walk Through - Session Registry]]"
   - "[[Mix Transport Implementation Walk Through - Connect Handshake]]"
 ---
-
-# Mix Transport Implementation Walk Through - Virtual Stream Registry
-
 This phase adds the state needed to represent multiple virtual application streams inside one established MixTransport session. It defines `TransportStream` in `libp2p_mix_transport/streams.nim` and makes each `TransportSession` responsible for registering and removing its streams.
 
 `TransportStream` now inherits from libp2p's `BufferStream`, and therefore from `Connection`. The session registry, frame router, application protocol handler and buffered read/write path all refer to the same stream object; there is no separate application wrapper.
