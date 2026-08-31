@@ -59,15 +59,18 @@ TransportSession* = ref object
   state: SessionState
   established: AsyncEvent
   receivedSurbGroups: Deque[seq[SURB]]
-  receivedSurbGroupsAvailable: AsyncEvent
+  replyCapacityStateChanged: AsyncEvent
   replySendLock: AsyncLock
-  pendingRefillBatchId: Opt[uint64]
-  nextRefillBatchId: uint64
-  streams: Table[uint64, TransportStream]
-  nextOutboundStreamId: uint64
+  nextRefillRequestAt: Opt[Moment]
+  outstandingRefillRequests: Table[RefillRequestId, Moment]
+  nextRefillRequestId: Opt[RefillRequestId]
+  refillResponseLifetime: Duration
+  maxOutstandingRefillRequests: int
+  streams: Table[StreamId, TransportStream]
+  nextOutboundStreamId: Opt[StreamId]
 ```
 
-The `established` event is how `connect` waits for `ConnectAck` without polling. The received-SURB queue and refill fields belong here because reply capacity is shared by all reverse traffic in the session, rather than by one virtual stream. The stream table routes a frame carrying `streamId` after the session has first been selected by `sessionId`.
+The `established` event is how `connect` waits for `ConnectAck` without polling. The received-SURB queue and refill fields belong here because reply capacity is shared by all reverse traffic in the session, rather than by one virtual stream. `nextRefillRequestAt` prevents the recipient from spending another reserved group before the previously submitted request has had time to produce a response. `outstandingRefillRequests` has a separate purpose: it records the individual request identifiers whose responses can still be accepted, including identifiers from earlier attempts that may produce valid late responses. The stream table routes a frame carrying `streamId` after the session has first been selected by `sessionId`.
 
 ## How Sessions Are Found
 
@@ -122,12 +125,15 @@ let session = TransportSession(
   state: SessionState.Pending,
   established: newAsyncEvent(),
   receivedSurbGroups: initDeque[seq[SURB]](),
-  receivedSurbGroupsAvailable: newAsyncEvent(),
+  replyCapacityStateChanged: newAsyncEvent(),
   replySendLock: newAsyncLock(),
-  pendingRefillBatchId: Opt.none(uint64),
-  nextRefillBatchId: 1,
-  streams: initTable[uint64, TransportStream](),
-  nextOutboundStreamId: 1,
+  nextRefillRequestAt: Opt.none(Moment),
+  outstandingRefillRequests: initTable[RefillRequestId, Moment](),
+  nextRefillRequestId: Opt.some(RefillRequestId(1)),
+  refillResponseLifetime: store.refillResponseLifetime,
+  maxOutstandingRefillRequests: store.maxOutstandingRefillRequests,
+  streams: initTable[StreamId, TransportStream](),
+  nextOutboundStreamId: Opt.some(StreamId(1)),
 )
 store.bySessionId[sessionId] = session
 store.byDestination[destination] = session
@@ -147,7 +153,7 @@ When it finds an initiator session, it removes the entry from `bySessionId` and 
 
 Calling `remove` again with the same `sessionId` is harmless: the first call has already removed the session, so the second call returns `none`.
 
-`MixTransport` owns one `SessionStore`. A current `TransportSession` also owns its stream table, received SURB groups, refill batch identifier, SURB-availability event and per-session reply-send lock. Per-stream retransmission payloads live in each `TransportStream`. During shutdown, `stop` first cancels handler and flow tasks, then clears the reply credential and session stores. Coordinated runtime session teardown is still incomplete because the disconnect and reset frames are not handled yet.
+`MixTransport` owns one `SessionStore`. A current `TransportSession` also owns its stream table, received SURB groups, refill-cycle state, bounded response-correlation table, reply-capacity event and per-session reply-send lock. Per-stream retransmission payloads live in each `TransportStream`. During shutdown, `stop` first cancels handler and flow tasks, then clears the reply credential and session stores. Coordinated runtime session teardown is still incomplete because the disconnect and reset frames are not handled yet.
 
 ## What the Tests Demonstrate
 
@@ -158,6 +164,8 @@ The second test creates a recipient session. It verifies that the destination is
 The third test first registers an initiator session. It then tries to reuse that destination with another pseudonym and to reuse that pseudonym for a recipient session. Both operations must fail, the store must still contain exactly one session, and both lookups must still return the original object. This test protects the rule that a rejected registration cannot partially modify the store or replace an established mapping.
 
 The fourth test removes an initiator session by its `sessionId`. It verifies that the session disappears from both tables and that repeating the removal returns `none` without changing any other state.
+
+The refill tests exercise state that is also owned by the session. One test schedules the next permitted request, accepts a response that leaves the supply at the low-water mark and verifies that another request becomes due immediately. A second test registers two request attempts, accepts the later response before the delayed earlier response and verifies that both responses add their groups while repeating either response identifier is rejected. Another test configures a two-entry response-correlation table, registers three requests with increasing deadlines and verifies that the first request is removed while the two newer requests remain acceptable. These tests demonstrate that request scheduling is independent from response acceptance, late responses are useful exactly once and bounding the correlation table does not terminate the session.
 
 ## How the Handshake Uses the Registry
 

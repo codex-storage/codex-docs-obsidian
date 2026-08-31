@@ -14,7 +14,7 @@ The implementation is divided across four modules:
 - `sessions.nim` owns the recipient's SURB groups, refill state and the lock that serializes return sends within one session.
 - `transport.nim` connects the standard libp2p `Connection` methods to those state machines. The module selects forward Mix delivery for frames sent by the session initiator and SURB delivery for frames sent by the session recipient.
 
-The current implementation bounds memory and propagates application backpressure. It does not yet retransmit lost Data, retry a lost refill request, or probe a stalled receive window. The state introduced here is the basis for those reliability mechanisms.
+The current implementation bounds memory, propagates application backpressure and retries a SURB refill while the recipient still has a group with which to send another request. It does not yet retransmit lost Data or probe a stalled receive window. The state introduced here is the basis for those remaining reliability mechanisms.
 
 ## The State Behind One Virtual Connection
 
@@ -361,7 +361,7 @@ The call to `ensureUnreservedSurbGroup` and the later call to `requestRefill` ex
 
 The code calls a SURB group unreserved when consuming that group would still leave `ReplyControlReserveGroups` groups in the session. Unreserved is not a group type or a flag stored on a group. The term describes whether the current number of groups is above the protected minimum.
 
-`ensureUnreservedSurbGroup` runs before the current frame consumes an unreserved SURB group. If the supply is already at or below the low-water mark, the helper uses `requestRefill` to consume one of the groups protected for control traffic and ask the initiator for new groups. The helper waits for the refill attempt to finish and reevaluates the queue. When a matching response contains too few valid groups to raise the queue above the reserve, the helper starts another refill batch. If the supply was already above the protected minimum, the helper returns without sending or waiting.
+`ensureUnreservedSurbGroup` runs before the current frame consumes an unreserved SURB group. If the supply is already at or below the low-water mark, the helper uses `requestRefill` to consume one of the groups protected for control traffic and ask the initiator for new groups. The helper waits for the refill attempt to finish and reevaluates the queue. When a matching response contains too few valid groups to raise the queue above the reserve, the helper starts another refill request. If the supply was already above the protected minimum, the helper returns without sending or waiting.
 
 `takeUnreservedSurbGroup` removes one group only when the remaining count will be at least `ReplyControlReserveGroups`. One logical return frame consumes this complete redundancy group. `sendWithSurbGroup` submits the same payload through every SURB in the group, moving each SURB exactly once:
 
@@ -716,7 +716,7 @@ proc takeUnreservedSurbGroup*(session: TransportSession): Result[seq[SURB], stri
 
 When the queue contains only the reserve, a recipient-side Data or ACK send cannot proceed immediately. The transport must request a refill, wait for that refill attempt to finish, and then inspect the queue again. Inspecting the queue again is important because a refill can contain fewer valid groups than requested.
 
-Each recipient-side `TransportSession` owns a manual-reset `AsyncEvent` named `replyCapacityStateChanged`. A task waiting for an unreserved group uses this event as a notification that the SURB queue or the pending-refill state has changed. The task must inspect both values after waking; the notification does not guarantee that an unreserved group is available.
+Each recipient-side `TransportSession` owns a manual-reset `AsyncEvent` named `replyCapacityStateChanged`. A task waiting for an unreserved group uses this event as a notification that the SURB queue or refill state has changed. The task must inspect the group count after waking; the notification does not guarantee that an unreserved group is available.
 
 ```nim
 proc clearReplyCapacityStateChanged*(session: TransportSession) =
@@ -728,7 +728,7 @@ proc waitForReplyCapacityStateChange*(
   session.replyCapacityStateChanged.wait()
 ```
 
-`replyCapacityStateChanged` tells the blocked send to reevaluate both parts of the recipient's reply-capacity state: the number of stored SURB groups and whether a refill batch is still pending. `addReceivedSurbGroups` fires the event after appending at least one group. Section 16 shows why completing a refill also fires the event even when the refill contains no valid groups.
+`replyCapacityStateChanged` tells the blocked send to inspect the stored SURB groups again. `addReceivedSurbGroups` fires the event after appending at least one group. Section 16 shows why accepting a refill response also fires the event before the response's valid groups are appended.
 
 The recipient adds newly received groups through `addReceivedSurbGroups`:
 
@@ -745,17 +745,21 @@ proc addReceivedSurbGroups*(
   for group in groups.mitems:
     session.receivedSurbGroups.addLast(move(group))
   if groups.len > 0:
+    if session.receivedSurbGroups.len > ReplyRefillLowWatermarkGroups:
+      session.nextRefillRequestAt = Opt.none(Moment)
     session.replyCapacityStateChanged.fire()
   ok()
 ```
 
+When the accumulated supply rises above the low-water mark, another refill request is no longer needed. The group-count check therefore removes the scheduled request deadline. If later reverse traffic reduces the supply again, the absence of a deadline allows proactive replenishment to start immediately.
+
 The reserve does not prevent control traffic from consuming a protected group. The next section shows that `requestRefill` intentionally uses `takeReceivedSurbGroup`, which can remove a group from the reserve, because restoring the SURB supply is the purpose for which the reserve exists.
 
-## 14. A RefillRequest Uses One Reserved Group
+## 14. A Refill Attempt Uses One Reserved Group
 
-Section 13 ended with a recipient-side Data or ACK task that cannot proceed while the SURB queue contains only the control reserve. Before that task can send its frame, the recipient must use one reserved group to ask the initiator for replacement groups. The task must then wait until the queue again contains a group above the reserve.
+Section 13 ended with a recipient-side Data or ACK task that cannot proceed while the SURB queue contains only the control reserve. Before that task can send its frame, the recipient must use one reserved group to ask the initiator for replacement groups. If the request or its response is lost, the recipient must use a different group for the next attempt because a SURB can be consumed only once.
 
-`ensureUnreservedSurbGroup` coordinates this process. While the queue contains no unreserved group, the procedure clears the previous capacity-state notification, calls `requestRefill` and waits for the reply-capacity state to change. After waking, the loop checks the queue again. If the completed refill supplied too few valid groups, the loop starts another refill instead of allowing the Data or ACK frame to consume the control reserve:
+`ensureUnreservedSurbGroup` coordinates refill requests while a reverse Data or ACK operation is waiting for capacity. The procedure does not distinguish an initial request from a retry. On every loop iteration, `requestRefill` sends another request only when supply remains low and the scheduled time for another attempt has arrived. If another request is not yet due, the procedure waits for either a response or the remaining delay:
 
 ```nim
 proc ensureUnreservedSurbGroup(
@@ -765,63 +769,96 @@ proc ensureUnreservedSurbGroup(
     session.clearReplyCapacityStateChanged()
     (await self.requestRefill(session)).isOkOr:
       return err(error)
-    await session.waitForReplyCapacityStateChange()
+    if session.receivedSurbGroupCount <= ReplyControlReserveGroups:
+      let waitTime = session.timeUntilNextRefillRequest()
+      if waitTime > ZeroDuration:
+        discard await session.waitForReplyCapacityStateChange().withTimeout(waitTime)
   ok()
 ```
 
-The loop does not need another group-count check between `requestRefill` and `waitForReplyCapacityStateChange`. Every operation that can complete a refill or add SURB groups fires `replyCapacityStateChanged`. Chronos `AsyncEvent` remains signalled until it is cleared, so a response that arrives while `requestRefill` is suspended makes the following wait return immediately. If the response has not arrived, the same wait suspends until the capacity state changes. The loop then checks the queue length again through its condition.
+The wait can finish for two reasons. A refill response can change the SURB supply and signal `replyCapacityStateChanged`, or the remaining delay can expire without a response. The loop then evaluates the current group count and request schedule again. A response containing enough valid groups lets the loop finish. A response containing too few valid groups removes the delay and allows another request immediately. If no response arrives, reaching `nextRefillRequestAt` allows another request.
 
-A refill batch is one request/response exchange used to add SURB groups to a session. The recipient sends one `RefillRequest`, and the initiator returns one matching `Refill`. Both frames carry the same `batchId`. The recipient stores the identifier of the request currently awaiting a response. This stored identifier prevents the recipient from accepting an old, duplicate or unsolicited `Refill`, and it limits the session to one refill batch in flight.
+Chronos `AsyncEvent` remains signalled until it is cleared. If a response arrives while `requestRefill` is suspended, `acceptRefillResponse` and `addReceivedSurbGroups` signal `replyCapacityStateChanged`, and the following wait returns immediately. The retry mechanism is demand-driven: time is measured from the preceding request, but no background task wakes solely to submit another request. A proactive refill submitted after an earlier reverse send is reconsidered when another reverse operation needs capacity.
 
-`requestRefill` coordinates this exchange. The first operation inside `requestRefill` is `session.beginRefill()`:
+`nextRefillRequestAt` stores the earliest time at which another request may be submitted while supply remains low. This scheduling deadline is separate from the lifetime of any response identifier. `refillRequestDue` combines the supply and scheduling checks:
+
+```nim
+func refillRequestDue*(session: TransportSession, now: Moment = Moment.now()): bool =
+  if session.role != SessionRole.Recipient or
+      session.receivedSurbGroups.len > ReplyRefillLowWatermarkGroups:
+    return false
+  let nextRefillRequestAt = session.nextRefillRequestAt.valueOr:
+    return true
+  nextRefillRequestAt <= now
+
+func timeUntilNextRefillRequest*(
+    session: TransportSession, now: Moment = Moment.now()
+): Duration =
+  let nextRefillRequestAt = session.nextRefillRequestAt.valueOr:
+    return ZeroDuration
+  if nextRefillRequestAt <= now:
+    ZeroDuration
+  else:
+    nextRefillRequestAt - now
+```
+
+When `nextRefillRequestAt` is absent, low supply permits a request immediately. After a request is prepared, `scheduleNextRefillRequest` stores `now + refillRequestTimeout`. A reverse operation arriving partway through the timeout waits only for the remaining duration rather than starting a new full timeout.
+
+`requestRefill` contains the one send path used for every attempt. When `refillRequestDue` returns true, the procedure calls `registerRefillRequest`, which allocates a new monotonically increasing `refillRequestId` and records the deadline until which the corresponding response will be accepted:
 
 ```nim
 proc requestRefill(
     self: MixTransport, session: TransportSession
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
-  let batchId = session.beginRefill().valueOr:
+  if not session.refillRequestDue:
     return ok()
 
+  let refillRequestId = session.registerRefillRequest().valueOr:
+    return err(error)
+
   var replyGroup = session.takeReceivedSurbGroup().valueOr:
-    session.cancelRefill(batchId)
+    session.cancelRefillRequest(refillRequestId)
     return err("could not reserve a SURB group for refill: " & error)
   let request = MixTransportFrame(
     version: MixTransportVersion,
     sessionId: session.sessionId,
     kind: FrameKind.RefillRequest,
-    batchId: Opt.some(batchId),
+    refillRequestId: Opt.some(refillRequestId),
     requestedGroups: Opt.some(DefaultRefillGroups.uint32),
   ).encode().valueOr:
-    session.cancelRefill(batchId)
+    session.cancelRefillRequest(refillRequestId)
     return err("could not encode RefillRequest: " & error)
+  session.scheduleNextRefillRequest(self.refillRequestTimeout)
   (await self.sendWithSurbGroup(replyGroup, request)).isOkOr:
-    session.cancelRefill(batchId)
+    session.cancelRefillRequest(refillRequestId)
     return err("could not send RefillRequest: " & error)
   ok()
 ```
 
-`beginRefill` delegates its condition to `refillNeeded`. A refill is needed only for a recipient-side session whose queue is at or below `ReplyRefillLowWatermarkGroups` and whose `pendingRefillBatchId` is empty. When those conditions hold, `beginRefill` takes the session's next monotonically increasing identifier, stores that identifier in `pendingRefillBatchId`, and returns it to `requestRefill`:
+The deadline is scheduled before `sendWithSurbGroup` yields. A response can arrive while that asynchronous submission is suspended. Recording the deadline first allows `acceptRefillResponse` to remove it without the resumed send later restoring an obsolete delay. If submission fails, `cancelRefillRequest` removes both the response identifier and the scheduled delay.
+
+`registerRefillRequest` records each individual attempt in `outstandingRefillRequests`. The table maps a `refillRequestId` to the deadline after which a response carrying that identifier is no longer accepted. Keeping several identifiers lets a delayed response from an earlier attempt contribute its SURBs after a later retry has already been submitted:
 
 ```nim
-func refillNeeded*(session: TransportSession): bool =
-  session.role == SessionRole.Recipient and
-    session.receivedSurbGroups.len <= ReplyRefillLowWatermarkGroups and
-    session.pendingRefillBatchId.isNone
-
-proc beginRefill*(session: TransportSession): Opt[uint64] =
-  if not session.refillNeeded:
-    return Opt.none(uint64)
-  let batchId = session.nextRefillBatchId
-  inc session.nextRefillBatchId
-  session.pendingRefillBatchId = Opt.some(batchId)
-  Opt.some(batchId)
+proc registerRefillRequest*(
+    session: TransportSession, now: Moment = Moment.now()
+): Result[RefillRequestId, string] =
+  # Role, supply, expiry and capacity checks precede this excerpt.
+  let refillRequestId = session.nextRefillRequestId.valueOr:
+    return err("refill request identifier space is exhausted")
+  session.nextRefillRequestId =
+    if refillRequestId == RefillRequestId.high:
+      Opt.none(RefillRequestId)
+    else:
+      Opt.some(refillRequestId + 1)
+  session.outstandingRefillRequests[refillRequestId] =
+    now + session.refillResponseLifetime
+  ok(refillRequestId)
 ```
 
-Recording `pendingRefillBatchId` before any `await` prevents another call from opening a second batch for the same session. If no refill is needed, `beginRefill` returns `none`; the `valueOr` branch at the beginning of `requestRefill` then returns success without removing a group or sending a frame.
+The response-tracking table has a configurable maximum of 1,024 entries by default. Before registering a request, the session removes expired entries. If the table remains full, the session removes the entry with the earliest response deadline and records the new request. This policy bounds correlation state without terminating a working session. A response for the removed identifier is ignored if it eventually arrives; responses for all identifiers that remain in the table are still accepted independently.
 
-When `beginRefill` returns an identifier, `requestRefill` intentionally calls `takeReceivedSurbGroup` rather than `takeUnreservedSurbGroup`. The call removes one group even though the queue is already at or below the protected minimum, because the group is being used for the control operation that restores the supply. `requestRefill` encodes the identifier and `DefaultRefillGroups` into `RefillRequest`, then sends redundant copies of that frame through the selected SURB group.
-
-Unlike `takeUnreservedSurbGroup`, `takeReceivedSurbGroup` checks only that at least one group exists. This is the operation that permits refill control traffic to consume a group from the protected minimum:
+After registration, `requestRefill` intentionally calls `takeReceivedSurbGroup` rather than `takeUnreservedSurbGroup`. The call can remove a group from the protected minimum because requesting replacement groups is the control operation for which the reserve exists:
 
 ```nim
 proc takeReceivedSurbGroup*(session: TransportSession): Result[seq[SURB], string] =
@@ -830,19 +867,20 @@ proc takeReceivedSurbGroup*(session: TransportSession): Result[seq[SURB], string
   ok(session.receivedSurbGroups.popFirst())
 ```
 
-`DefaultRefillGroups` equals `MaxRefillGroupsPerFrame`, currently two. A single `Refill` frame can therefore carry every group requested by one `RefillRequest`. The recipient rebuilds a larger supply through repeated two-group refill cycles rather than requesting a multipart response.
+`DefaultRefillGroups` equals `MaxRefillGroupsPerFrame`, currently two. A single `Refill` frame can therefore carry every group requested by one `RefillRequest`. The recipient rebuilds a larger supply through repeated two-group requests rather than using a multipart response.
 
-If no group is available, frame encoding fails, or every redundant SURB submission fails immediately, `requestRefill` calls `cancelRefill`. `cancelRefill` clears the pending identifier only when the failing operation still owns the current batch, allowing a later operation to try again:
+If no group is available, frame encoding fails, or every redundant SURB submission fails immediately, `requestRefill` calls `cancelRefillRequest`. The procedure removes the identifier allocated for the failed local attempt, removes the delay before another request and wakes a task waiting for the reply-capacity state to change:
 
 ```nim
-proc cancelRefill*(session: TransportSession, batchId: uint64) =
-  if session.pendingRefillBatchId == Opt.some(batchId):
-    session.pendingRefillBatchId = Opt.none(uint64)
+proc cancelRefillRequest*(session: TransportSession, refillRequestId: RefillRequestId) =
+  session.outstandingRefillRequests.del(refillRequestId)
+  session.nextRefillRequestAt = Opt.none(Moment)
+  session.replyCapacityStateChanged.fire()
 ```
 
-After `takeReceivedSurbGroup` removes a group, the current implementation does not put that group back into the queue on an error. Reusing the group would be unsafe after any SURB submission was attempted; restoring it after an earlier encoding failure would require a separate error path that is not currently implemented. Once at least one redundant request is submitted, `pendingRefillBatchId` remains set until the recipient receives a matching `Refill`. The current implementation has no timeout for a submitted request whose redundant copies are all lost in transit.
+After `takeReceivedSurbGroup` removes a group, the implementation does not put that group back into the queue on an error. Reusing the group would be unsafe after any SURB submission was attempted. If repeated timeouts consume every remaining group before a valid response arrives, the next retry cannot be sent and the blocked Data or ACK operation returns an error.
 
-The recipient branch of `sendStreamFrame`, shown in full in Section 5, calls `ensureUnreservedSurbGroup` before removing the group used by the current Data or ACK frame. After submitting that frame, the same branch calls `requestRefill` again. This second call does not wait for another group. It starts a refill only when consuming the current frame's group brought the queue back to the low-water mark; otherwise `beginRefill` returns `none` and no control frame is sent.
+The recipient branch of `sendStreamFrame`, shown in full in Section 5, calls `ensureUnreservedSurbGroup` before removing the group used by the current Data or ACK frame. After submitting that frame, the same branch calls `requestRefill` again. This second call proactively starts a refill when consuming the current frame's group brought the queue back to the low-water mark. The second call does not wait, because the current Data or ACK frame has already been submitted.
 
 The recipient also calls `requestRefill` immediately after accepting a new inbound stream. `sendStreamResponse` has just consumed a group to return `StreamAck`, so this call replenishes the session before the mounted application protocol begins using the stream. The relevant context is the successful tail of `handleOpenStream`:
 
@@ -889,9 +927,7 @@ proc handleRefillRequest(
     version: MixTransportVersion,
     sessionId: session.sessionId,
     kind: FrameKind.Refill,
-    batchId: frame.batchId,
-    partIndex: Opt.some(0'u32),
-    partCount: Opt.some(1'u32),
+    refillRequestId: frame.refillRequestId,
     surbGroups: prepared.encoded,
   )
   (await self.sendStreamFrame(session, refill)).isOkOr:
@@ -901,28 +937,36 @@ proc handleRefillRequest(
 
 Each group currently contains two redundant SURBs because `DefaultRefillSurbRedundancy` is two. The `Refill` itself travels from initiator to recipient through the regular forward Mix path selected by the initiator branch of `sendStreamFrame`.
 
-The wire format contains `partIndex` and `partCount`, but the current refill policy always sends one frame with `partIndex = 0` and `partCount = 1`. If submitting that frame fails immediately, `retireReplyGroups` consumes the newly registered private credentials because the corresponding public SURBs did not reach the recipient and cannot produce usable replies.
+The refill response always fits in one transport frame, so the wire format does not carry multipart indexes. If submitting that frame fails immediately, `retireReplyGroups` consumes the newly registered private credentials because the corresponding public SURBs did not reach the recipient and cannot produce usable replies.
 
-## 16. The Recipient Accepts Its Pending Batch
+## 16. The Recipient Accepts Every Tracked Refill Response Once
 
 The explanation returns to the session recipient. The forward `Refill` arrives through the Mix delivery handler registered for `MixTransportCodec`. `handleDelivery` decodes the transport frame and dispatches `FrameKind.Refill` to `handleRefill`.
 
 The local encoder and the inbound decoder apply different SURB checks for a deliberate reason. `MixTransportFrame.encode` uses strict validation and refuses to serialize an empty group or a SURB byte string whose size is not `SurbSize`; locally generated traffic must always be well formed. `MixTransportFrame.decode` still validates the frame size, frame kind and field relationships, but leaves the contents of each received `SurbGroup` for `decodeSurbs`. Without this separation, one malformed group would make the wire decoder reject the complete `Refill` before `handleRefill` could retain the other groups.
 
-`handleRefill` first resolves an established recipient-side session. Before decoding any groups, the procedure passes the frame's `batchId` to `completeRefill`. The `completeRefill` procedure compares that identifier with `pendingRefillBatchId`. An old, duplicate or unsolicited `Refill` therefore returns without changing the session:
+`handleRefill` first resolves an established recipient-side session. Before decoding any groups, the procedure passes the frame's `refillRequestId` to `acceptRefillResponse`. This operation purges expired entries and accepts the response only when its identifier remains in `outstandingRefillRequests`. Acceptance removes the identifier before returning, so a duplicate response carrying the same public SURBs cannot add them twice:
 
 ```nim
-proc completeRefill*(session: TransportSession, batchId: uint64): bool =
-  if not session.isPendingRefill(batchId):
+proc acceptRefillResponse*(
+    session: TransportSession,
+    refillRequestId: RefillRequestId,
+    now: Moment = Moment.now(),
+): bool =
+  discard session.purgeExpiredRefillRequests(now)
+  if not session.outstandingRefillRequests.hasKey(refillRequestId):
     return false
-  session.pendingRefillBatchId = Opt.none(uint64)
+  session.outstandingRefillRequests.del(refillRequestId)
+  session.nextRefillRequestAt = Opt.none(Moment)
   session.replyCapacityStateChanged.fire()
   true
 ```
 
-A matching identifier clears `pendingRefillBatchId` and fires `replyCapacityStateChanged`. Clearing the pending identifier finishes that batch even when some or all of the attached groups are malformed. The recipient-side send waiting in `ensureUnreservedSurbGroup` must wake after this state change: the send may now use newly received groups or, when the queue still contains only the control reserve, start another refill batch.
+The table can contain identifiers from several attempts made while the supply remained low. Accepting one response does not remove the other identifiers. If a response for a later attempt arrives first and a delayed response for an earlier attempt arrives afterward, both responses contribute their groups, provided that each identifier is still tracked and has not expired. This behavior is important because the recipient spent a different one-use SURB group on every attempt; discarding the useful return paths from a valid late response would waste that capacity.
 
-After `completeRefill` accepts the batch identifier, `handleRefill` decodes each attached group independently. A malformed group is skipped, while every valid group is retained in `decodedGroups`. Retaining valid groups is preferable to rejecting the complete frame because even one valid group can preserve the recipient's ability to request another refill. The complete handler is:
+`acceptRefillResponse` removes `nextRefillRequestAt` because a received response ends the delay assigned to the corresponding attempt. If decoding does not raise the supply above the low-water mark, the absent deadline lets `ensureUnreservedSurbGroup` send another request immediately. The procedure also fires `replyCapacityStateChanged` before any SURB group has been decoded. A response containing no valid group must still wake the blocked send. Chronos uses cooperative scheduling, so `handleRefill` continues through group decoding and `addReceivedSurbGroups` without yielding; the waiting task observes the completed synchronous state changes when it resumes.
+
+After the identifier is accepted, `handleRefill` decodes each attached group independently. A malformed group is skipped, while every valid group is retained in `decodedGroups`. Retaining valid groups is preferable to rejecting the complete frame because even one valid group can preserve the recipient's ability to send another refill request. The complete handler is:
 
 ```nim
 proc handleRefill(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises: [].} =
@@ -931,8 +975,8 @@ proc handleRefill(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises
   if session.role != SessionRole.Recipient or session.state != SessionState.Established:
     return
 
-  let batchId = frame.batchId.get()
-  if not session.completeRefill(batchId):
+  let refillRequestId = frame.refillRequestId.get()
+  if not session.acceptRefillResponse(refillRequestId):
     return
 
   var decodedGroups = newSeqOfCap[seq[SURB]](frame.surbGroups.len)
@@ -943,9 +987,7 @@ proc handleRefill(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises
   discard session.addReceivedSurbGroups(decodedGroups)
 ```
 
-The final `addReceivedSurbGroups` call appends every successfully decoded group. If the new queue contains more than the control reserve, `ensureUnreservedSurbGroup` returns and the waiting Data or ACK frame consumes one unreserved group. If the new queue still contains only the reserve, the loop calls `requestRefill` again with a new batch identifier. A short refill therefore contributes every usable group and drives another refill attempt when the recipient still has a control group available.
-
-The current retry is response-driven rather than timer-driven. A matching `Refill` that contains too few valid groups triggers another request. If the original `RefillRequest` or its complete response is lost, no completion event occurs and the pending batch remains set; the timeout-based retry described in the remaining reliability work is still required for that case.
+The final `addReceivedSurbGroups` call appends every successfully decoded group. When the accumulated queue grows above the low-water mark, the blocked Data or ACK operation can consume one unreserved group. When the queue still contains only the reserve, `nextRefillRequestAt` remains absent and `ensureUnreservedSurbGroup` submits another request. A short response and a valid late response can therefore combine their groups until the session has enough reverse-send capacity.
 
 ## 17. Teardown Wakes Every Flow Task
 
@@ -1043,7 +1085,7 @@ if not await receivedResponseFuture.withTimeout(TestOperationTimeout):
 let receivedResponse = await receivedResponseFuture
 ```
 
-This exchange exercises both directions explicitly. Initiator Data travels through forward Mix delivery, and the recipient returns its ACK through a SURB group. Recipient Data travels through SURB groups, and the initiator returns its ACK through forward Mix delivery. The same exchange exercises ordered delivery at both endpoints, the recipient's control reserve and a one-frame refill cycle. `TestOperationTimeout` is a test failure guard for operations that never complete; successful synchronization comes from transport handshakes, queue notifications and stream reads rather than fixed sleeps.
+This exchange exercises both directions explicitly. Initiator Data travels through forward Mix delivery, and the recipient returns its ACK through a SURB group. Recipient Data travels through SURB groups, and the initiator returns its ACK through forward Mix delivery. The same exchange exercises ordered delivery at both endpoints, the recipient's control reserve and a one-frame refill exchange. `TestOperationTimeout` is a test failure guard for operations that never complete; successful synchronization comes from transport handshakes, queue notifications and stream reads rather than fixed sleeps.
 
 ## Remaining Reliability Work
 
@@ -1053,7 +1095,7 @@ The implemented flow bounds memory and carries application bytes in both directi
 
 - Receiving duplicate Data causes the receiver to send its latest absolute ACK again, which recovers when the Data arrived but the preceding ACK was lost. If submitting an ACK itself returns an error, `runAcknowledgements` currently exits, so later changes to the receive window no longer produce ACKs on that stream.
 
-- After the recipient successfully submits `RefillRequest`, the batch remains recorded in `pendingRefillBatchId` until a matching `Refill` arrives. If every redundant copy of the request or the response is lost, no timeout clears the batch or starts another request.
+- Refill retries continue only while a recipient-side Data or ACK operation is waiting for an unreserved SURB group. The transport does not yet run a background refill task, and it does not proactively send SURBs from the initiator when the recipient has become silent. If retries consume every remaining group before any response arrives, the blocked operation fails because the recipient has no return path through which to request more groups.
 
 - A sender stops allocating new sequences when `nextOutboundSequence` reaches the remote receive-window limit. If the receiver advanced its window but every ACK carrying the new `receiveBase` was lost, the sender has no persist probe: it does not periodically send a small control frame that prompts the receiver to repeat its current window information.
 

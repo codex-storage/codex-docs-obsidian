@@ -66,16 +66,14 @@ MixTransportFrame* {.proto2.} = object
   version* {.fieldNumber: 1, required, pint.}: uint32
   sessionId* {.fieldNumber: 2, required, ext.}: PeerId
   kind* {.fieldNumber: 3, required, ext.}: FrameKind
-  streamId* {.fieldNumber: 4, pint.}: Opt[uint64]
-  sequence* {.fieldNumber: 5, pint.}: Opt[uint64]
+  streamId* {.fieldNumber: 4, fixed.}: Opt[StreamId]
+  sequence* {.fieldNumber: 5, fixed.}: Opt[SequenceNumber]
   payload* {.fieldNumber: 6.}: Opt[seq[byte]]
   codec* {.fieldNumber: 7.}: Opt[string]
-  receiveBase* {.fieldNumber: 8, pint.}: Opt[uint64]
+  receiveBase* {.fieldNumber: 8, fixed.}: Opt[SequenceNumber]
   acknowledgementBitmap* {.fieldNumber: 9.}: Opt[seq[byte]]
-  batchId* {.fieldNumber: 10, pint.}: Opt[uint64]
+  refillRequestId* {.fieldNumber: 10, pint.}: Opt[RefillRequestId]
   requestedGroups* {.fieldNumber: 11, pint.}: Opt[uint32]
-  partIndex* {.fieldNumber: 12, pint.}: Opt[uint32]
-  partCount* {.fieldNumber: 13, pint.}: Opt[uint32]
   surbGroups* {.fieldNumber: 14.}: seq[SurbGroup]
   rejectionReason* {.fieldNumber: 15.}: Opt[string]
 ```
@@ -90,9 +88,9 @@ Every frame carries `version`, `sessionId` and `kind`. `sessionId` is the initia
 | `sequence`, `payload` | `Data` |
 | `codec` | `OpenStream` |
 | `receiveBase`, `acknowledgementBitmap` | `Ack` |
-| `batchId` | `RefillRequest`, `Refill` |
+| `refillRequestId` | `RefillRequest`, `Refill` |
 | `requestedGroups` | `RefillRequest` |
-| `partIndex`, `partCount`, `surbGroups` | `Refill` |
+| `surbGroups` | `Refill` |
 | `rejectionReason` | optionally `StreamReject` |
 | `surbGroups` | also `Connect` and optionally `OpenStream` |
 
@@ -178,7 +176,7 @@ MixTransport does not reconstruct private SURB fields. Validation checks that ea
 
 ## The Current One-Packet Refill Contract
 
-`RefillRequest` carries `batchId` and `requestedGroups`. Validation limits the request:
+`RefillRequest` carries `refillRequestId` and `requestedGroups`. `refillRequestId` identifies one request and allows the recipient to process its response at most once. Validation limits the number of requested groups:
 
 ```nim
 of FrameKind.RefillRequest:
@@ -187,23 +185,21 @@ of FrameKind.RefillRequest:
     "refill requests too many groups"
 ```
 
-`MaxRefillGroupsPerFrame` is currently two. The recipient never requests more groups than can fit in one Sphinx packet. If it needs more, it sends another request after the current batch completes.
+`MaxRefillGroupsPerFrame` is currently two. The recipient never requests more groups than can fit in one Sphinx packet. If the session still needs more reply capacity after processing the response, the recipient sends another request.
 
-The returned frame still carries `partIndex` and `partCount`, but the current sender always emits one part:
+The initiator copies the request identifier into the one returned `Refill` frame:
 
 ```nim
 MixTransportFrame(
   version: MixTransportVersion,
   sessionId: session.sessionId,
   kind: FrameKind.Refill,
-  batchId: frame.batchId,
-  partIndex: Opt.some(0'u32),
-  partCount: Opt.some(1'u32),
+  refillRequestId: frame.refillRequestId,
   surbGroups: prepared.encoded,
 )
 ```
 
-The recipient does not accumulate multipart refills. It accepts a `Refill` only when its `batchId` matches the one pending request, then adds all groups from that frame. `partIndex` and `partCount` preserve a possible extension point, but they do not describe a current multipart implementation.
+The recipient does not accumulate multipart refills. The response either fits in one Sphinx packet or the recipient asks for fewer groups. The removed `partIndex` and `partCount` fields therefore represented no implemented behavior.
 
 ## Stream Rejection Is Diagnostic, Not Enumerated
 
@@ -232,9 +228,9 @@ require frame.sequence.isSome == (frame.kind == FrameKind.Data),
   "sequence does not match the frame kind"
 require frame.receiveBase.isSome == (frame.kind == FrameKind.Ack),
   "receiveBase does not match the frame kind"
-require frame.batchId.isSome ==
+require frame.refillRequestId.isSome ==
   (frame.kind in {FrameKind.RefillRequest, FrameKind.Refill}),
-  "batchId does not match the frame kind"
+  "refillRequestId does not match the frame kind"
 ```
 
 For example, `Data` without `sequence` is rejected, and `ConnectAck` carrying `sequence` is also rejected. The same pattern covers payload, codec, ACK state, refill metadata and rejection reason.
