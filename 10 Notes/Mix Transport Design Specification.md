@@ -94,9 +94,9 @@ To avoid simultaneous allocation collisions without another coordination exchang
 
 The wire protocol represents a stream identifier with the `StreamId` alias, currently a 32-bit unsigned integer encoded as Protobuf `fixed32`. The session allocator owns the odd or even progression and records exhaustion explicitly instead of allowing the value to wrap. Keeping the primitive width behind `StreamId` confines a future width change to the transport's identifier domain, although such a wire-format change still requires a new protocol version.
 
-`dial(destination, codec)` reuses or establishes the session, registers a pending outbound stream and sends `OpenStream`. The recipient resolves `codec` through the Switch multistream registry, applies `LPProtocol.reserveIncoming(session.peerId)`, and either sends `StreamReject` with a bounded diagnostic reason or registers the matching inbound stream and sends `StreamAck`.
+`dial(destination, codec)` reuses or establishes the session, registers a pending outbound stream and sends `OpenStream`. The recipient resolves `codec` through the Switch multistream registry, applies `LPProtocol.reserveIncoming(session.peerId)`, and either sends `StreamReject` with a bounded diagnostic reason or registers the matching inbound stream, prepares its bounded receive path and sends `StreamAck`.
 
-The initiator returns the stream only after recovering `StreamAck`. The recipient configures and establishes its stream only after submitting that acknowledgement. It then starts the mounted protocol handler as a separate task so a long-running application read loop does not block later Mix deliveries.
+The initiator returns the stream only after recovering `StreamAck`. Before publishing that acknowledgement, the recipient configures and establishes its stream so Data sent immediately after the first redundant ACK copy is accepted. After at least one copy succeeds, the recipient starts the mounted protocol handler as a separate task so a long-running application read loop does not block later Mix deliveries. The same publication rule applies to `ConnectAck`: recipient session state becomes operational before the first positive acknowledgement copy can reach the initiator. Complete failure of every redundant copy permits rollback because no positive acknowledgement was published.
 
 `TransportStream` inherits from libp2p's `BufferStream`. The stream stored in the session table, passed to the protocol handler and used for application reads and writes is one object rather than a wrapper around separate transport state.
 
@@ -178,7 +178,7 @@ An accepted stream owns one ordered-delivery task and one ACK task. A recipient 
 
 Reply credential capacity rejects a new group rather than evicting an unrelated in-flight credential. Successful recovery consumes its redundancy group. Cryptographic recovery failure preserves the remaining group opportunity, while successful cryptographic recovery followed by invalid transport decoding consumes the group because every redundant copy carries the same malformed plaintext.
 
-Runtime close, reset and complete peer-drop behavior still require the corresponding remote wire exchanges and explicit session resource reclamation.
+Runtime close, reset and complete peer-drop behavior still require the corresponding remote wire exchanges and explicit session resource reclamation. Once a session or stream has been established, an endpoint that closes it normally should make a best-effort attempt to send `CloseStream` or `Disconnect` before removing its local state. Cancellation and failure should similarly use `ResetStream` or `ResetSession` when a return path is still available. These notifications allow the remote endpoint, including an initiator waiting for further traffic, to release its state immediately instead of discovering the closure only through a timeout. Sending a notification must not delay cancellation or make local cleanup depend on successful Mix delivery; if notification is no longer possible, teardown proceeds locally.
 
 ## Logos Storage Integration
 

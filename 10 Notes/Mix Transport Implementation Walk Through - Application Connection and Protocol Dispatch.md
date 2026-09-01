@@ -44,21 +44,25 @@ The normal libp2p multistream dispatcher performs the same reservation before in
 
 ## Starting the Application Handler
 
-After registering the inbound stream and successfully submitting `StreamAck`, the recipient installs the stream's write callback, starts its Data-delivery and ACK tasks, marks the stream established, requests a SURB refill when needed, and starts `runProtocolHandler` as an independent asynchronous task. `handleOpenStream` tracks the handler future in `MixTransport.handlerTasks` and then returns. It does not wait for the application handler to finish.
+After registering the inbound stream, the recipient installs the stream's write callback, starts its Data-delivery and ACK tasks, and marks the stream established before submitting `StreamAck`. The first redundant acknowledgement may reach the initiator while the recipient is still sending the remaining copies. Preparing the bounded receive path first ensures that Data sent immediately by the initiator is retained rather than rejected because the recipient stream is still pending.
+
+After at least one `StreamAck` copy has been submitted successfully, the recipient transfers stream and protocol-reservation cleanup to `runProtocolHandler`, starts that handler as an independent asynchronous task, and proactively requests a SURB refill when needed. `handleOpenStream` tracks the handler future in `MixTransport.handlerTasks` and does not wait for the application handler to finish.
 
 The relevant sequence in `handleOpenStream` is:
 
 ```nim
+self.configureStream(session, stream)
+stream.establish()
 if not await self.sendStreamResponse(session, stream.streamId, FrameKind.StreamAck):
   return
 
-self.configureStream(session, stream)
-stream.establish()
-discard await self.requestRefill(session)
 keepStream = true
 keepReservation = true
 self.handlerTasks.trackFut(runProtocolHandler(session, stream, protocol))
+discard await self.requestRefill(session)
 ```
+
+If every acknowledgement copy fails, the existing deferred cleanup removes and closes the stream and releases the incoming protocol reservation. Cancellation follows the same cleanup path because it explicitly terminates the local stream-opening operation, regardless of whether an earlier copy escaped. If submission completes with at least one successful copy, the stream remains established and `runProtocolHandler` owns its eventual cleanup.
 
 The distinction is important because a protocol such as block exchange keeps its handler active while it reads messages from the connection. Waiting for that read loop inside `handleOpenStream` would prevent the `OpenStream` delivery from completing and could delay the later `Data` deliveries needed to satisfy the read. Instead, the execution is separated as follows:
 

@@ -66,7 +66,7 @@ MixTransport decodes the Protobuf frame and handles it as a new session only whe
 2. It deserializes every public SURB in every reply group. If any group cannot be decoded, it rejects the complete frame without creating a session.
 3. It creates a pending recipient session identified by the received pseudonym.
 4. It moves all decoded reply groups into that session.
-5. It removes the first complete reply group from the session and uses it to send `ConnectAck`.
+5. It removes the first complete reply group from the session, marks the recipient session established, and uses that group to send `ConnectAck`.
 
 The session stores complete groups rather than individual SURBs. One outgoing transport frame consumes one group, and every SURB within that group carries a redundant copy of the same frame. Treating the group as one unit prevents a SURB intended as redundancy for one logical reply from being reassigned to a different reply.
 
@@ -79,9 +79,11 @@ ConnectAck bytes -> SURB 1A -> return Mix path
                  -> SURB 1B -> return Mix path
 ```
 
-Each call to `MixProtocol.sendWithSurb` consumes the supplied SURB, even if that send reports an error. The helper therefore tries every SURB in the group and considers the group submitted when at least one call succeeds. If every call fails, the recipient removes the newly created session because it could not send the acknowledgement required to establish the relationship.
+Each call to `MixProtocol.sendWithSurb` consumes the supplied SURB, even if that send reports an error. The helper therefore tries every SURB in the group and considers the group submitted when at least one call succeeds. If every call fails, the recipient removes the newly created session because no acknowledgement was published.
 
-After at least one redundant acknowledgement has been submitted, the recipient marks its local session established. The second reply group remains available to carry later control traffic. `OpenStream` supplies additional groups, and the implemented refill policy preserves two control groups before ordinary reverse Data or ACK traffic may proceed.
+The recipient marks its local session established before submitting the first redundant acknowledgement. This ordering is required because the first copy can reach the initiator while the recipient is still awaiting later sends. Once the initiator observes `ConnectAck`, it may immediately send `OpenStream` or Data; the recipient must already accept that session traffic. Complete acknowledgement failure removes the session. Cancellation also removes it because cancellation explicitly terminates the local handshake, regardless of whether an earlier copy escaped.
+
+The second reply group remains available to carry later control traffic. `OpenStream` supplies additional groups, and the implemented refill policy preserves two control groups before ordinary reverse Data or ACK traffic may proceed.
 
 ## Recovering ConnectAck on the Initiator
 
@@ -111,7 +113,7 @@ If SURB creation, credential registration, frame encoding, Mix submission, or th
 
 `removeSession(sessionId)` in `ReplyCredentialStore` first purges all entries whose reply-group deadline has passed. It then removes the still-active credentials belonging to the failed session and retires their identifiers until their original group deadlines. Credentials owned by other active sessions remain registered. A session can own groups with different deadlines because later SURB refills will create new groups at different times.
 
-The recipient similarly removes its new session if it cannot decode the supplied groups, install them, encode `ConnectAck`, or submit the acknowledgement through at least one SURB.
+The recipient similarly removes its new session if it cannot decode the supplied groups, install them, encode `ConnectAck`, or submit the acknowledgement through at least one SURB. The recipient establishes the local state before publication, but complete acknowledgement failure is still a definite rollback condition because no initiator could have acted on the acknowledgement.
 
 ## Current Behavior When Packets Are Lost
 

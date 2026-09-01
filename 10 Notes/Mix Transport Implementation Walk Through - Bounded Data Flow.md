@@ -882,7 +882,7 @@ After `takeReceivedSurbGroup` removes a group, the implementation does not put t
 
 The recipient branch of `sendStreamFrame`, shown in full in Section 5, calls `ensureUnreservedSurbGroup` before removing the group used by the current Data or ACK frame. After submitting that frame, the same branch calls `requestRefill` again. This second call proactively starts a refill when consuming the current frame's group brought the queue back to the low-water mark. The second call does not wait, because the current Data or ACK frame has already been submitted.
 
-The recipient also calls `requestRefill` immediately after accepting a new inbound stream. `sendStreamResponse` has just consumed a group to return `StreamAck`, so this call replenishes the session before the mounted application protocol begins using the stream. The relevant context is the successful tail of `handleOpenStream`:
+The recipient also calls `requestRefill` after successfully submitting `StreamAck` for a new inbound stream. `sendStreamResponse` has consumed a group for that acknowledgement, so the later call proactively replenishes the session. Before publishing `StreamAck`, the recipient configures and establishes the stream so Data sent after the first redundant acknowledgement copy enters the bounded receive path. The relevant context is the successful tail of `handleOpenStream`:
 
 ```nim
 proc handleOpenStream(
@@ -890,18 +890,18 @@ proc handleOpenStream(
 ): Future[void] {.async: (raises: [CancelledError]).} =
   # Session lookup, SURB import, protocol lookup and stream admission precede
   # this successful setup path.
+  self.configureStream(session, stream)
+  stream.establish()
   if not await self.sendStreamResponse(session, stream.streamId, FrameKind.StreamAck):
     return
 
-  self.configureStream(session, stream)
-  stream.establish()
-  discard await self.requestRefill(session)
   keepStream = true
   keepReservation = true
   self.handlerTasks.trackFut(runProtocolHandler(session, stream, protocol))
+  discard await self.requestRefill(session)
 ```
 
-The `keepStream` and `keepReservation` assignments transfer cleanup responsibility to `runProtocolHandler`. Their complete lifecycle belongs to [[Mix Transport Implementation Walk Through - Application Connection and Protocol Dispatch]]. In the bounded-flow path, the important operation is the `requestRefill` call between stream establishment and starting the application handler.
+The `keepStream` and `keepReservation` assignments transfer cleanup responsibility to `runProtocolHandler`. They occur immediately after successful ACK submission and before the next cancellable operation, because the initiator may already be using the stream. Their complete lifecycle belongs to [[Mix Transport Implementation Walk Through - Application Connection and Protocol Dispatch]]. In the bounded-flow path, the final `requestRefill` call is the proactive replenishment step after the acknowledgement consumes a group.
 
 ## 15. The Initiator Creates the New Return Paths
 
@@ -1027,6 +1027,8 @@ proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError])
 
 `CloseStream`, `ResetStream`, `Disconnect` and `ResetSession` already have wire-format identifiers, but neither endpoint currently sends or handles those frames through the complete transport path. The implemented shutdown therefore cleans up local tasks and state; it does not yet notify the remote endpoint that a stream or session has ended.
 
+A future lifecycle increment should send a best-effort notification when an established stream or session is closed and a delivery path remains available. A normal close should use `CloseStream` or `Disconnect`; cancellation or failure should use `ResetStream` or `ResetSession`. The remote endpoint can then remove its corresponding state immediately rather than waiting for a traffic or liveness timeout. This notification is an optimization of remote cleanup, not a prerequisite for local teardown: cancellation must continue immediately, and local cleanup must complete even when the notification cannot be sent or is lost.
+
 ## The Tests as an Executable Walkthrough
 
 The tests cover the flow at three different boundaries. `tests/test_streams.nim` tests receive-window state without a live Mix network. `tests/test_wire.nim` tests the Protobuf representation accepted by both endpoints. `tests/test_connect.nim` runs the application-visible exchange through five live Mix nodes.
@@ -1101,6 +1103,6 @@ The implemented flow bounds memory and carries application bytes in both directi
 
 - Every accepted chunk, duplicate and `receiveBase` advancement currently wakes the ACK task immediately. A delayed-ACK policy could combine state changes that occur within a short interval and reduce Mix-packet and SURB consumption, but no delay timer or threshold policy is implemented.
 
-- `CloseStream`, `ResetStream`, `Disconnect` and `ResetSession` are represented in the wire enum but are not sent and handled by both endpoints. Consequently, local cancellation removes local state, while the remote endpoint learns about closure only through later failures or its own cleanup.
+- `CloseStream`, `ResetStream`, `Disconnect` and `ResetSession` are represented in the wire enum but are not sent and handled by both endpoints. Consequently, local cancellation removes local state, while the remote endpoint learns about closure only through later failures or its own cleanup. A future lifecycle increment should send the applicable notification on a best-effort basis when a delivery path remains, without delaying cancellation or making local teardown depend on its delivery.
 
 These additions affect transport scheduling and lifecycle management. They do not require changing the application-facing `Connection` API, and the retransmission and delayed-ACK work can continue to use the existing sequence numbers, `receiveBase` and fixed acknowledgement bitmap.

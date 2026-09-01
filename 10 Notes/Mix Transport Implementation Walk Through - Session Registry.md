@@ -45,7 +45,7 @@ SessionState = Pending | Established
 
 The role records which endpoint created the local session state. An initiator session was created by the endpoint that started the handshake. A recipient session was created by the endpoint that received the corresponding `Connect` frame.
 
-Both roles initially use `Pending`, but the state has a different immediate meaning on each endpoint. On the initiator, `Pending` means that `Connect` has not yet produced a valid `ConnectAck`. On the recipient, it means that the incoming `Connect` is being accepted and its acknowledgement is being prepared. The recipient calls `establish` after submitting `ConnectAck`; the initiator calls it after recovering a valid matching acknowledgement.
+Both roles initially use `Pending`, but the state has a different immediate meaning on each endpoint. On the initiator, `Pending` means that `Connect` has not yet produced a valid `ConnectAck`. On the recipient, it means that the incoming `Connect` is being validated and its acknowledgement is being prepared. The recipient calls `establish` immediately before submitting `ConnectAck`, so the recipient can process session traffic as soon as the first redundant acknowledgement reaches the initiator. The initiator calls `establish` after recovering a valid matching acknowledgement.
 
 `Established` means that the transport relationship is ready to carry virtual streams. The state belongs to `TransportSession` because it describes the relationship between the two transport endpoints, rather than the lifetime of any individual stream opened through that relationship.
 
@@ -171,27 +171,32 @@ The refill tests exercise state that is also owned by the session. One test sche
 
 The implemented `Connect` handshake now uses these operations directly. The initiating MixTransport generates a fresh session pseudonym and calls `addInitiatorSession(destination, sessionId)` before sending `Connect`. Keeping the session in `Pending` state gives the returning `ConnectAck` handler a stable object to find through the `sessionId` carried by the acknowledgement.
 
-The recipient's `Connect` handler reads the pseudonym from the frame and calls `addRecipientSession(sessionId)`. It attaches the public SURB groups received from the initiator to that session, uses the first group to send `ConnectAck`, and marks the recipient session established after at least one acknowledgement copy has been submitted successfully.
+The recipient's `Connect` handler reads the pseudonym from the frame and calls `addRecipientSession(sessionId)`. It attaches the public SURB groups received from the initiator, prepares `ConnectAck` and marks the recipient session established before sending the first redundant acknowledgement copy. The initiator can therefore act on an acknowledgement without racing the recipient's state transition.
 
-The recipient establishes the session only after the acknowledgement has been accepted for sending:
+The relevant order is:
 
 ```nim
 let session = self.sessions.addRecipientSession(frame.sessionId).valueOr:
   return
+var keepSession = false
+defer:
+  if not keepSession:
+    discard self.sessions.remove(frame.sessionId)
+
 session.addReceivedSurbGroups(decodedGroups).isOkOr:
-  discard self.sessions.remove(frame.sessionId)
   return
 
 var replyGroup = session.takeReceivedSurbGroup().valueOr:
-  discard self.sessions.remove(frame.sessionId)
   return
 
-(await self.sendWithSurbGroup(replyGroup, acknowledgement)).isOkOr:
-  discard self.sessions.remove(frame.sessionId)
-  return
 session.establish()
+(await self.sendWithSurbGroup(replyGroup, acknowledgement)).isOkOr:
+  return
+keepSession = true
 ```
 
-This order matters. If the recipient cannot decode or store the supplied SURBs, cannot reserve a group for the acknowledgement, or cannot submit any redundant acknowledgement, it removes the new session instead of retaining local state that the initiator can never confirm.
+This order matters because `sendWithSurbGroup` awaits the redundant sends sequentially. The first copy may reach the initiator while the recipient is still submitting the remaining copies. Establishing the recipient session first guarantees that an immediate `OpenStream` or Data frame is not discarded as traffic for a pending session.
+
+If every copy fails, `sendWithSurbGroup` returns an error and the deferred cleanup removes the session. If cancellation interrupts acknowledgement submission, the same cleanup removes the session because cancellation explicitly ends the local handshake, regardless of whether an earlier copy escaped. If submission completes with at least one successful copy, `keepSession` preserves the established state needed to process the traffic that the acknowledgement authorized.
 
 When the initiator recovers and validates `ConnectAck`, it looks up the pending session by `sessionId` and marks that same object established. A later `connect(destination)` call finds it through `byDestination` and returns the existing session instead of starting another handshake. The complete exchange is described in [[Mix Transport Implementation Walk Through - Connect Handshake]].
