@@ -9,134 +9,147 @@ related:
   - "[[Mix Transport Implementation Walk Through - Session Registry]]"
   - "[[Mix Transport Implementation Walk Through - Stream Establishment Round Trip]]"
 ---
+This note explains why MixTransport needs a SURB replenishment mechanism and how the push and pull parts of that mechanism work together. The note develops the communication model first and introduces the protocol mechanisms only after explaining the problems they solve. [[Mix Transport Implementation Walk Through - SURB Replenishment]] maps this design to concrete types and procedures.
 
-This note defines how MixTransport supplies the session recipient with return paths to the anonymous session initiator. SURBs are created, transmitted, acknowledged and stored individually. Several SURBs are grouped only while the recipient sends redundant copies of one reverse transport frame. A supplied SURB does not belong to a persistent wire-level group.
+The implemented strategy stores and supplies SURBs individually. Several SURBs are brought together only when the recipient sends redundant copies of one reverse frame. No persistent redundancy group is represented in the wire format.
 
-The implemented policy combines proactive supply from the session initiator with refill requests from the session recipient. Proactive supply is enabled by default. Disabling proactive supply leaves the request-driven path active, which is useful for comparison and controlled deployments but cannot recover after the recipient has exhausted every return path.
+## Communication Directions and Session Roles
 
-## Communication Roles
+A MixTransport session has an initiator and a recipient. The initiator creates the session by sending `Connect` to the recipient's real Mix destination. The recipient learns the session pseudonym carried by `Connect`, but the recipient does not learn an address through which it could send a normal Mix packet back to the anonymous initiator.
 
-The session initiator knows the recipient's real Mix destination and can submit forward Mix packets at any time. The session recipient knows only the session pseudonym and cannot address the initiator through the forward path. Every frame sent from the recipient to the initiator must therefore use a SURB created by the initiator.
+This document calls a packet from the initiator to the recipient a forward packet. The initiator can create a forward packet whenever it knows the recipient's Mix destination. A packet from the recipient back to the initiator is a reverse packet. The recipient can send a reverse packet only through a single-use reply block, or SURB, previously created by the initiator.
 
-The initiator sends individual public SURBs to the recipient. The recipient stores those SURBs in one bounded queue owned by `TransportSession`. When the recipient needs to send reverse Data, an ACK or a control frame, the recipient removes `DefaultReplySurbRedundancy` SURBs from the queue and sends the same encoded frame through each selected SURB. The current redundancy value is two.
+Creating a SURB produces two related values. The public SURB gives the recipient a one-use mechanism for sending one encrypted reply. The corresponding private reply credential remains with the initiator and is required to recover the payload when the returned packet arrives. The initiator must therefore create return paths before the recipient can send anything in the reverse direction.
 
-The initiator retains one private `ReplyCredential` for each public SURB. The recipient decides later which SURBs will carry the same logical frame, so the initiator cannot associate credentials with a persistent redundancy group. Each returned packet is recovered with its own credential. The transport frame's idempotent state transition or logical sequence identifier prevents redundant copies from applying the same effect twice.
+## Storing Return Paths for a Session
 
-## Session-Level Ownership
+The initiator sends public SURBs to the recipient. The recipient keeps available SURBs in one queue owned by the recipient-side transport session. This queue is called the shared session queue in the remainder of this note.
 
-SURBs belong to a session rather than to one stream. A return packet contains a `streamId` when it addresses a stream, so any SURB in the session queue can carry traffic for any stream in that session. The same queue also supplies session-level control traffic.
+The queue belongs to the session rather than to an individual stream. A reverse stream frame identifies its stream, so any SURB in the shared queue can carry traffic for any stream in that session. The same queue can also carry session-level control frames.
 
-Per-stream queues would leave valid SURBs unavailable when one stream is idle and another stream needs return capacity. Closing a stream would also discard return paths that remain valid for the session. Session ownership gives every reverse operation access to the same bounded supply and gives session teardown one precise cleanup boundary.
+One shared queue prevents SURBs from becoming stranded in an idle stream while another stream needs a return path. Closing one stream also does not discard SURBs that remain useful to other streams in the same session.
 
-The queue is protected by a session-level reply-send lock. The lock serializes the sequence of checking available capacity, removing the SURBs for one temporary redundancy batch, encoding the latest supply snapshot and submitting the reverse frame. Incoming supply does not acquire this lock because the current sender may be waiting for those SURBs.
+When the recipient sends one reverse frame, it removes several individual SURBs from the shared queue and sends the same encoded frame through each selected SURB. This temporary collection is a redundancy batch. The current policy selects two SURBs, giving the logical frame two independent opportunities to reach the initiator.
 
-## Bootstrap Supply
+The redundancy batch exists only for that send operation. The recipient decides which SURBs to select and how many copies to send. Because persistent groups are not imposed on the queue or wire format, a later policy can choose a different redundancy count for a particular session, stream or frame kind.
 
-`Connect` carries four unnumbered bootstrap SURBs. The recipient validates and stores them, removes two for the redundant `ConnectAck`, and retains two for later control traffic. The recipient then initializes numbered supply accounting and includes the initial supply snapshot in `ConnectAck`.
+The initiator retains the private credential for every supplied SURB independently. Each returned packet is recovered through the credential corresponding to the SURB that carried it. Transport operations that may arrive redundantly are idempotent or carry a logical sequence identifier, so recovering a later copy does not apply the same logical operation twice.
 
-`OpenStream` carries two additional unnumbered SURBs. These SURBs are dedicated to the corresponding `StreamAck` or `StreamReject`; the recipient uses them immediately and does not add them to the session queue. This separation prevents stream-opening response paths from bypassing the numbered session-supply capacity.
+## Establishing the Initial Supply
 
-After the session has been established, ordinary replenishment uses only numbered `SurbSupply` frames.
+The replenishment protocol cannot start until both endpoints have created the session. The initiator must nevertheless give the recipient enough return paths to acknowledge `Connect`. For that reason, `Connect` carries four bootstrap SURBs.
 
-## Bounded Supply Credit
+After accepting `Connect`, the recipient stores the four bootstrap SURBs in the shared session queue. The recipient removes two SURBs to send two copies of `ConnectAck`. The other two remain available for one subsequent reverse control operation.
 
-The recipient queue has a hard capacity named `recipientSurbCapacity`. The default is sixteen SURBs, and the minimum is the four-SURB control reserve plus one two-SURB ordinary reply batch.
+The initiator also supplies dedicated response paths when opening a stream. `OpenStream` carries two SURBs that the recipient uses immediately for `StreamAck` or `StreamReject`. These two SURBs exist only for that stream-opening exchange and are not inserted into the shared session queue.
 
-The recipient advertises an absolute, monotonically increasing `surbSupplyLimit`. The limit is the exclusive upper bound on supply sequence numbers that the initiator may introduce. If the limit is fourteen, the initiator may create sequences zero through thirteen. Whenever the recipient removes a stored SURB for a reverse transmission, the recipient increments the limit by one and thereby authorizes one replacement.
+Once `ConnectAck` confirms that the session exists at both endpoints, the initiator can begin maintaining the shared session queue through the post-establishment replenishment mechanism described below.
 
-The initial limit accounts for bootstrap SURBs that remain in the queue. With the default capacity, `Connect` leaves two SURBs after forming the `ConnectAck` batch, so `ConnectAck` advertises an initial limit of fourteen. Supplying sequences zero through thirteen fills the queue to sixteen without exceeding its configured capacity.
+## Why Replenishment Must Be Bounded
 
-The limit is absolute rather than an instruction to add a quantity. Repeating the same limit grants no additional capacity, and an older snapshot cannot retract capacity already observed by the initiator.
+The initiator can create and send SURBs faster than the recipient can consume them. Allowing every arriving SURB to remain in memory would let the recipient's queue grow without limit. MixTransport therefore configures a maximum number of SURBs that the recipient may retain in the shared session queue. The current default is sixteen.
 
-## Numbered Supply
+A simple request for a fixed number of new SURBs is not sufficient. A request or its response may be duplicated, delayed or delivered out of order. Interpreting each copy as permission to add another quantity would allow duplicate messages to create duplicate capacity.
 
-Every public SURB supplied after establishment receives a monotonically increasing `SurbSupplySequence`. One `SurbSupply` frame carries `firstSurbSequence` followed by as many as four serialized SURBs. Sequence numbers for later values are consecutive.
+Instead, the recipient grants absolute supply credit. Every SURB sent after session establishment receives a sequence number. The credit is an exclusive upper limit: a credit value of fourteen permits the initiator to send sequence numbers zero through thirteen. Repeating the same credit value grants no additional permission.
 
-The recipient tracks accepted supply sequences with `surbSupplyReceiveBase` and a fixed 256-bit acknowledgement bitmap. A bitmap bit at offset `i` records receipt of sequence `surbSupplyReceiveBase + i`. The recipient accepts valid supply out of order, stores each SURB once and advances the receive base across a contiguous prefix of set bits.
+The initial credit reflects the queue positions still free after `ConnectAck` is sent. With the default capacity of sixteen, two bootstrap SURBs remain in the queue and fourteen positions are free. The first `ConnectAck` therefore authorizes fourteen numbered SURBs.
 
-Receipt and consumption are different events. A bitmap bit remains recorded after the corresponding SURB has been consumed from the queue. This receipt history is necessary because retransmission of a consumed one-use SURB must still be recognized as a duplicate rather than inserted into the queue again.
+Whenever the recipient removes SURBs from the shared queue for a reverse transmission, the same number of queue positions become free. The recipient increases the absolute credit by that number, allowing the initiator to replace the consumed SURBs without exceeding the configured queue capacity.
 
-The initiator may introduce a sequence only when the sequence is below `surbSupplyLimit` and inside the 256-position receive window beginning at the reported receive base. These two checks bound the recipient queue and the initiator's retained retransmission state.
+The two SURBs attached to `OpenStream` remain outside the shared queue and outside this credit calculation. If they were inserted into the queue, they would occupy positions without consuming numbered supply credit. The initiator would then believe more queue positions were available than the recipient could actually accept.
 
-Each serialized SURB is decoded independently. If one item in a supply frame is malformed, the recipient retains the other valid items and leaves a sequence gap for the malformed item. Retransmission of the original valid serialization can later fill that gap.
+## Identifying Supplied SURBs
 
-## Absolute Supply Snapshots
+Loss and reordering require the recipient to distinguish a new SURB from a retransmission of one it has already stored or consumed. The initiator therefore assigns a monotonically increasing sequence number to every SURB supplied after establishment.
 
-A supply snapshot contains three fields:
+The initiator sends numbered SURBs in `SurbSupply` frames. One frame states the sequence number of its first SURB and carries as many as four serialized SURBs. Later entries in the same frame use consecutive sequence numbers.
 
-```text
-surbSupplyReceiveBase
-surbSupplyAcknowledgementBitmap
-surbSupplyLimit
-```
+The recipient records the first sequence number not covered by a contiguous prefix of received supply. This value is the supply receive base. The recipient also keeps a fixed bitmap describing which later sequences have already arrived beyond a gap.
 
-The receive base and bitmap tell the initiator which public SURB serializations the recipient has accepted. The initiator removes acknowledged serializations from its retransmission table. The supply limit tells the initiator which new sequences the recipient has authorized.
+For example, suppose the receive base is ten. If sequences ten and twelve arrive while sequence eleven is missing, the bitmap records both arrivals. The recipient can advance the receive base to eleven because sequence ten completed the next contiguous position, while the shifted bitmap continues to record sequence twelve.
 
-`ConnectAck` carries the initial snapshot. Later recipient-originated Data, ACK and stream-response frames carry the latest snapshot. `RefillRequest` and `SurbStatus` also carry a complete snapshot. The three fields are present together or absent together, so the initiator never applies a partial supply update.
+The bitmap covers a fixed window of 256 sequence positions beginning at the receive base. The recipient accepts a supplied SURB only when its sequence is inside this window, is permitted by the current absolute credit, has not been recorded before, and the shared queue still has capacity. These conditions bound both the queue and the state required to remember out-of-order arrivals.
 
-Snapshots are absolute and idempotent. Duplicate or reordered snapshots can acknowledge additional known sequences, but they cannot allocate the same sequence twice or decrease a limit already observed by the initiator.
+Receiving a SURB and consuming that SURB are different events. When the recipient later removes a SURB from the shared queue, the receive base and bitmap continue recording that its sequence arrived. A retransmitted copy can therefore be rejected as a duplicate even after the first copy has already been consumed.
 
-## Proactive Supply
+Each serialized SURB in a supply frame is decoded independently. If one entry is malformed, the recipient keeps the other valid entries and leaves a gap at the malformed entry's sequence. Retransmission can later fill that gap.
 
-After `ConnectAck` establishes an initiator-side session, MixTransport starts one SURB supplier task owned by that `TransportSession`. With `enableProactiveSurbReplenishment = true`, the supplier creates numbered SURBs until it has used the credit advertised by the recipient.
+## Reporting Receipt and Available Capacity
 
-The supplier creates no more than four new SURBs per `SurbSupply` frame. For every new SURB, the initiator registers the private credential once and retains the public serialization under its supply sequence. The forward frame is then submitted to the recipient through the ordinary Mix path.
+The initiator must learn two facts maintained by the recipient. First, the initiator needs to know which numbered SURBs arrived so that their public serializations no longer need retransmission. Second, the initiator needs to know how much absolute credit is available for sending new SURBs.
 
-When a reverse snapshot increases `surbSupplyLimit`, the session signals the supplier task. The supplier uses the newly authorized sequence positions to replace SURBs that the recipient consumed. When a snapshot acknowledges supplied sequences, the supplier discards only the retained public serializations; their private reply credentials remain registered until those SURBs carry replies, expire or the session closes.
+The recipient reports both facts in one supply snapshot. The snapshot contains the receive base, the fixed acknowledgement bitmap and the absolute supply limit. The implementation represents these values as `surbSupplyReceiveBase`, `surbSupplyAcknowledgementBitmap` and `surbSupplyLimit`.
 
-The constructor option controls proactive emission only. Both endpoints continue to understand numbered supply and refill requests regardless of the option. With proactive emission disabled, an initiator waits until a `RefillRequest` marks the session as urgently needing supply.
+`ConnectAck` carries the initial snapshot. Later reverse Data, ACK, `StreamAck`, `StreamReject`, `RefillRequest` and `SurbStatus` frames carry the recipient's latest snapshot. Carrying all three values together prevents the initiator from applying receipt information without the corresponding view of available capacity.
 
-## Recipient-Initiated Refill
+Snapshots describe absolute state rather than changes relative to the previous message. Receiving the same snapshot twice does not acknowledge another SURB or grant additional credit. A delayed snapshot also cannot move the initiator's stored receive base or supply limit backwards.
 
-The recipient protects four stored SURBs for control traffic. An ordinary reverse Data or ACK transmission is permitted only when removing its two-SURB redundancy batch leaves that reserve intact.
+When a snapshot acknowledges a numbered SURB, the initiator removes that SURB's public serialization from its retransmission state. The initiator keeps the corresponding private reply credential because the recipient may still hold the public SURB and use it for a future reverse frame.
 
-When the recipient has fewer than six SURBs, `ensureUnreservedSurbs` calls `requestRefill`. A due refill request consumes two SURBs, attaches the recipient's current absolute supply snapshot and travels to the initiator through both return paths. The request does not contain a requested quantity or a request identifier.
+## Proactive Replenishment
 
-The initiator applies the snapshot and marks the session's supplier as urgent. The same supplier task used for proactive replenishment then creates as many new numbered SURBs as the current credit permits. Repeating a refill request does not create a second logical operation: the repeated absolute snapshot is safe to apply, and the urgency flag remains a boolean condition.
+After recovering `ConnectAck`, the initiator starts one supplier task for the established session. The supplier compares the next unused sequence number with the most recent credit reported by the recipient. When credit remains available, the supplier creates new SURBs and sends them to the recipient without waiting for an explicit request.
 
-`nextRefillRequestAt` limits request frequency. If useful supply has not arrived after thirty seconds, a blocked reverse sender can submit another refill request while it still has a redundancy batch available. Receiving enough SURBs clears the pending retry deadline.
+Before sending a new public SURB, the initiator registers its private credential and retains the public serialization under the assigned sequence number. Recording both values before the asynchronous send ensures that a fast returned packet cannot refer to state that the initiator has not yet installed.
 
-With proactive replenishment enabled, exhausting the queue does not immediately fail the waiting reverse operation because the status-probe path can restore synchronization. In pull-only mode, the operation returns an error when the recipient no longer has two SURBs with which to send another request.
+When a later reverse snapshot increases the absolute credit, the supplier wakes and replaces the SURBs that the recipient consumed. When the snapshot acknowledges receipt of supplied sequences, the initiator stops retaining their public serializations for retransmission.
+
+Proactive replenishment is enabled by default. The `enableProactiveSurbReplenishment` constructor option can disable creation triggered solely by unused credit. Disabling proactive creation does not disable the supply protocol; the same supplier task waits for a refill request from the recipient instead.
+
+## Recipient-Initiated Replenishment
+
+The pull path lets the recipient explicitly wake the supplier when the shared queue is becoming too small for reverse application traffic. The recipient protects four SURBs for control traffic. Sending reverse Data or ACK requires two additional SURBs, so an application-related reverse send waits until at least six SURBs are available.
+
+While the queue remains below that level, the recipient attempts to send `RefillRequest`. A refill request removes two SURBs from the protected control supply and sends the same request through both return paths. Removing those SURBs frees two queue positions, so the request includes the resulting higher absolute credit together with the latest receipt state.
+
+The request contains neither a requested quantity nor a transaction identifier. After receiving `RefillRequest`, the initiator applies its absolute snapshot and marks the existing supplier task as urgent. The supplier then uses all credit currently available. Receiving the same request more than once repeats the same state and urgency condition rather than creating multiple refill transactions.
+
+The recipient rate-limits refill requests while waiting for new supply. If sufficient supply has not arrived after thirty seconds, the recipient may use another control redundancy batch to repeat the request. Once enough SURBs are available for an application-related reverse send, the recipient clears the scheduled retry.
+
+Pull-only operation still depends on the recipient retaining enough SURBs to send another request. If fewer than two remain, the recipient cannot reach the anonymous initiator through the pull path. The proactive recovery mechanism described below addresses this condition when proactive replenishment is enabled.
 
 ## Retransmitting Supply
 
-New supply remains in the initiator's `pendingSurbSupply` table until a recipient snapshot acknowledges it. Each entry retains the supplied SURB's public serialization and the identifier of its private reply credential. After a supply submission completes, the initiator assigns each still-pending entry a retransmission deadline. The default delay is thirty seconds.
+A forward `SurbSupply` frame may be lost. Until the recipient acknowledges a supplied sequence, the initiator retains the serialized public SURB and assigns it a retransmission deadline. The default deadline is thirty seconds after the previous send attempt.
 
-When the earliest deadline expires, the supplier first purges expired credentials and expired retired-identifier records from the reply credential store. The supplier then verifies that the private credential identified by the pending entry remains active. If the credential is absent, the supplier removes the pending public serialization instead of retransmitting a return path that the initiator can no longer recover. Otherwise, the supplier retransmits the same serialized public SURB with the same sequence number. The retransmission does not create a new SURB, register another private credential or extend the existing credential's TTL. If the original and retransmitted packets both arrive, the recipient's receive base and bitmap cause one copy to be stored and the other to be ignored.
+The retained entry also records the identifier of the corresponding private reply credential. Before retransmission, the initiator purges expired credentials and expired retired-identifier records from the reply credential store. The initiator then verifies that the selected credential remains active.
 
-Taking an entry for retransmission temporarily clears its deadline while the send is in progress. After the attempt completes, the sender schedules another deadline only if the entry remains pending. A snapshot can acknowledge and remove the entry while the asynchronous send is running; the completion path never recreates an acknowledged entry.
+If the credential is absent, the initiator removes the retained public serialization instead of retransmitting it. A reply sent through that SURB could no longer be recovered. If the credential remains active, the initiator retransmits the same public serialization with the same supply sequence. Retransmission creates neither a new SURB nor a new credential and does not extend the credential's original lifetime.
 
-## Recovering from Complete Recipient Starvation
+If the original and retransmitted packets both reach the recipient, the sequence tracking described above causes one copy to be stored and the other to be ignored. If a supply acknowledgement arrives while retransmission is being submitted, the acknowledgement removes the retained entry and completion of the send does not recreate it.
 
-Supply retransmission alone cannot repair every feedback loss. The recipient can consume its last stored SURBs while all reverse frames carrying the increased limit are lost. The initiator then sees no new credit, while the recipient has no return path through which to report its actual state.
+## Recovering When the Recipient Has No Return Path
 
-With proactive replenishment enabled, the initiator sends a `SurbStatusProbe` after the session has produced no reverse supply snapshot for the configured interval. The default interval is two minutes. A probe carries two freshly created SURBs dedicated to one redundant `SurbStatus` response.
+Proactive supply and supply retransmission still depend on the initiator learning when the recipient has freed queue positions. The recipient can consume its final SURBs and increase its absolute credit, but every reverse frame carrying the updated snapshot can be lost. The initiator then sees no new credit, while the recipient has no SURB left with which to report its current state.
 
-The recipient uses the probe SURBs immediately and does not insert them into the session queue. The returned `SurbStatus` contains the recipient's current receive base, acknowledgement bitmap and supply limit. Applying that snapshot lets the initiator resume ordinary numbered supply even when the recipient queue was empty.
+When proactive replenishment is enabled, the initiator treats a long absence of reverse snapshots as a reason to check the recipient's state. After the configured interval, currently two minutes, the initiator sends a forward `SurbStatusProbe`.
 
-Every probe uses fresh SURBs because the initiator cannot know whether a previous probe reached the recipient and its response was lost. Probe credentials remain governed by the reply credential store's capacity and expiry policy.
+The probe carries two fresh SURBs dedicated to its response. The recipient uses these SURBs immediately to send two copies of `SurbStatus`; the recipient does not insert them into the shared queue. `SurbStatus` carries the current receive base, acknowledgement bitmap and absolute credit.
 
-## Interaction with Application Traffic
+Applying the returned snapshot lets the initiator resume numbered supply even when the recipient's shared queue was empty. Every probe uses fresh SURBs because the initiator cannot determine whether an earlier probe was lost or whether its response was lost.
 
-SURB replenishment is driven by transport-level consumption rather than by calls to `readLp` or `readExactly`. The recipient increments supply credit when MixTransport removes SURBs for a reverse frame. This event occurs before the initiator can recover the reply and before an application can read its payload.
+## Relationship to Application Data Flow
 
-MixTransport observes application writes through `TransportStream.write`, but the current supplier does not derive a speculative SURB target from the write length. The recipient's hard queue capacity and absolute credit remain the authoritative limits. A future scheduler can use known reverse demand to prioritize replenishment without changing the wire protocol.
+Replenishment accounts for SURBs when MixTransport removes them from the shared queue for a reverse frame. The recipient grants replacement credit at that moment. The mechanism does not depend on when the initiator's application reads the recovered frame payload.
 
-Application read observation is a separate flow-control concern. The current receive window limits chunks accepted by the transport, while libp2p's `BufferStream` stores bytes that have been delivered in order but not yet consumed by the application. Overriding the read path could provide byte-level consumption feedback later, but that feedback is not required to account for SURB consumption.
+MixTransport observes application writes through the virtual stream, but the supplier does not predict future SURB demand from the size of a write. The recipient's bounded queue and absolute credit remain the authoritative limits on supply.
 
-## Session Shutdown
+Application byte-flow control solves a separate problem. The Data receive window bounds chunks accepted out of order, and libp2p's `BufferStream` bounds bytes delivered in order but not yet consumed by the application. These byte limits do not replace the SURB queue limit because one mechanism bounds application data while the other bounds one-use anonymous return paths.
 
-The supplier task is owned by `TransportSession`. Session shutdown signals the supplier's state event, cancels the task and waits for its completion before shutting down the session's streams. Reply credential cleanup then removes credentials associated with the session, including unused supply and status-probe credentials.
+## Session Lifetime
 
-The recipient's queue, supply bitmap and credit counters share the session lifetime. A new anonymous session starts a new supply sequence space and cannot reuse acknowledgements or credit from an earlier session.
+The supplier task, shared SURB queue, supply sequence state and registered streams share the lifetime of one transport session. Session shutdown cancels and awaits the supplier task, closes the session's streams and removes reply credentials associated with the session.
 
-## Implemented Safety Properties
+A new anonymous session begins with an empty shared queue and a new supply sequence space. Receipt acknowledgements and credit from an earlier session cannot be applied to the new session.
 
-- The recipient queue cannot exceed `recipientSurbCapacity`.
-- The initiator cannot create new numbered supply beyond the recipient's absolute credit or the fixed receive window.
-- A retransmitted SURB is stored at most once, including after the first copy has already been consumed.
-- Every valid SURB in a partly malformed supply frame is accepted independently.
-- Public SURB retransmission does not duplicate private credentials.
-- Refill requests are idempotent urgency signals rather than correlated refill transactions.
-- Proactive status probes can restore the recipient's ability to report credit after its ordinary SURB queue reaches zero.
-- Session shutdown terminates the supplier and bounds the lifetime of session-owned supply state.
+## Resulting Safety Properties
+
+- The recipient never retains more SURBs than the configured shared-queue capacity.
+- The initiator cannot introduce new numbered SURBs beyond the recipient's absolute credit or the fixed receive window.
+- Retransmitting a supplied SURB does not create another private credential.
+- The recipient stores at most one copy of a numbered SURB, including when the original has already been consumed.
+- A malformed SURB does not prevent other valid SURBs from the same supply frame from being accepted.
+- Refill requests repeat absolute state and cannot grant duplicate capacity.
+- Status probes allow the recipient to report available capacity even after its shared queue becomes empty.
+- Session shutdown bounds the lifetime of session-owned supply state and reply credentials.

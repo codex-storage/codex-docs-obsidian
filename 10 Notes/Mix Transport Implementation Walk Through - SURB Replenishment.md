@@ -8,7 +8,6 @@ related:
   - "[[Mix Transport Implementation Walk Through - Bounded Data Flow]]"
   - "[[Mix Transport Implementation Walk Through - Reply Credential Store]]"
 ---
-
 This walk-through follows the implemented hybrid SURB replenishment path from the initial `ConnectAck` credit advertisement through proactive supply, recipient-initiated refill, supply retransmission and complete-starvation recovery. The transport sends and stores individual SURBs. A redundancy batch exists only while the recipient sends several copies of one reverse frame.
 
 The implementation is divided between three files:
