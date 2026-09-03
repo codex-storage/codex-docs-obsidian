@@ -5,6 +5,7 @@ related:
   - "[[New Logos Storage Discovery]]"
   - "[[Mix Transport - Pluggable Integration Model]]"
   - "[[Mix Transport Implementation Walk Through]]"
+  - "[[Mix Transport SURB Replenishment Strategy]]"
 ---
 
 # Mix Transport Design Specification
@@ -132,7 +133,9 @@ Application writes may exceed one Sphinx payload. MixTransport divides each writ
 
 Application write boundaries are not visible at the read side. Concurrent writes to one stream are serialized, and the remote endpoint reconstructs one ordered byte stream.
 
-Every submitted chunk remains in the sender's `pendingOutbound` table until acknowledged. The current `MaxInflightChunks` is 64. This table is the bounded source for future retransmission; the current implementation does not yet schedule retries.
+Every submitted chunk remains in the sender's `pendingOutbound` table until acknowledged. The current `MaxInflightChunks` is 64. When Data retransmission is enabled, each retained chunk receives a fixed retransmission deadline after its initial submission and after each retry. The default timeout is 30 seconds. Retries continue until an ACK removes the chunk or the stream closes; a future RTT-based policy may replace the fixed timeout.
+
+Data retransmission is enabled by default. `newMixTransport` accepts `enableDataRetransmissions = false` for deployments that prefer delivery attempts without automatic Data retries. Disabling retransmission does not remove `pendingOutbound`: the retained chunks are still required for ACK processing, the in-flight bound and remote receive-window enforcement.
 
 The sender also respects the remote receive limit derived from the latest acknowledged receive base. It cannot introduce a sequence outside the 256-position window advertised by the remote endpoint.
 
@@ -160,21 +163,23 @@ This design bounds transport memory without modifying libp2p's read implementati
 
 ## Return Delivery and SURB Supply
 
-Forward frames from the session initiator use `MixProtocol.send` with the real destination. Every frame originated by the session recipient uses one received SURB redundancy group and enters the initiator through raw reply recovery.
+Forward frames from the session initiator use `MixProtocol.send` with the real destination. The session recipient cannot address the anonymous initiator through the forward Mix path. Every Data, ACK, or control frame sent by the recipient therefore consumes one session-owned SURB redundancy group and reaches the initiator through raw reply recovery.
 
-Reverse Data and recipient-originated ACKs share the same SURB supply. Their complete send operations are serialized by a per-session lock so concurrent application and ACK tasks cannot interleave refill decisions or remove the same logical capacity. Different sessions remain independent, and inbound Refill processing does not acquire the send lock.
+SURB groups are shared by all streams in a session. A per-session send lock ensures that concurrent reverse Data, ACK, and control operations cannot remove the same group. The recipient keeps the group queue within a configured capacity, while the initiator keeps the corresponding private reply credentials until a group is used, expires, or the session closes.
 
-The recipient maintains a control reserve of two groups. SURB groups do not have separate reserved and unreserved representations. Data and ACK traffic may consume a group only when at least two groups will remain afterward. When supply reaches the low-water mark and another request is permitted by the refill schedule, the recipient consumes one group from that protected minimum to send `RefillRequest`.
+The intended replenishment mechanism combines proactive initiator supply with recipient requests. The recipient advertises an absolute `surbSupplyLimit`, which authorizes the initiator to introduce only a bounded number of uniquely numbered groups. The initiator retains each numbered supply entry until the recipient acknowledges it and retransmits the same public groups after loss; retransmission never creates replacement credentials for an already numbered entry. The recipient uses a receive base and fixed bitmap to accept out-of-order supply, suppress duplicates, and report which public groups the initiator may stop retaining.
 
-One request asks for at most two groups, the maximum currently accepted in one returned Sphinx packet. The initiator creates those public SURBs, registers their private credentials, and sends one forward `Refill` carrying the `refillRequestId` copied from `RefillRequest`. A refill response is never multipart. Locally encoded frames require every SURB group to be well formed. On receipt, structural frame validation is separated from per-group SURB decoding so that one malformed group does not reject valid groups in the same response. The recipient processes each response identifier at most once, decodes every group independently and retains every valid group. If the retained supply is still no greater than the control reserve, the blocked return send starts another one-packet refill attempt. This allows a valid subset to preserve the session's ability to replenish itself instead of discarding useful SURBs with the malformed groups.
+Reverse transport frames carry the recipient's latest supply acknowledgement and credit state when space permits. A recipient-side refill request remains available as an urgent signal when the local supply is low. If the recipient's session pool is empty and reverse status cannot be sent, the initiator can send a forward status probe with a dedicated reply group. The recipient uses the probe's group immediately to return its current supply state instead of storing the group in the session pool. This exchange restores synchronization without requiring the recipient to have a stored session group available beforehand.
 
-A matching response with too few valid groups permits another refill request immediately. After submitting any request, the recipient records the earliest time at which another request may be sent. If no response arrives before that time, a blocked recipient-side Data or ACK operation sends another request with a fresh identifier and a fresh SURB group. This scheduling deadline is independent from response correlation. Identifiers from earlier requests remain acceptable until their response lifetimes expire, so valid late responses still contribute their SURBs. Each response identifier is consumed when first accepted, which prevents a duplicate response from adding the same SURBs twice. The response-correlation table is bounded; after expired entries are removed, registering into a full table evicts the entry with the earliest deadline instead of terminating the session.
-
-Refill retries continue while reverse traffic is waiting for capacity and the recipient still owns a group with which to send another request. There is no independent background refill task and no unsolicited initiator refill. When all remaining groups are consumed before any valid response arrives, the blocked reverse operation fails because the recipient no longer has a return path for another request.
+The current implementation contains the recipient-initiated refill path and its protected control reserve. The proactive supplier, numbered supply acknowledgements, absolute credit, and terminal starvation probe remain to be implemented. [[Mix Transport SURB Replenishment Strategy]] defines the complete mechanism, its safety bounds, and the incremental transition from the current implementation.
 
 ## Task and Resource Lifetime
 
-An accepted stream owns one ordered-delivery task and one ACK task. A recipient application stream also has a tracked protocol-handler task. Closing the local `TransportStream` wakes Data, ACK and capacity events; transport shutdown unregisters Mix handlers, cancels and waits for handler and stream tasks, clears reply credentials, and then clears sessions.
+Task ownership follows the transport hierarchy. `MixTransport` owns its sessions. Each `TransportSession` owns its registered streams. Each `TransportStream` owns its ordered-delivery and ACK tasks and, for an accepted inbound application stream, the protocol-handler invocation and incoming protocol reservation.
+
+Closing a `TransportStream` wakes Data, ACK, capacity and stream-opening waiters and explicitly requests cancellation of its handler and internal tasks. The explicit cancellation also reaches a task that is no longer waiting on a stream event because it is suspended inside Mix delivery or SURB replenishment. `closeImpl` does not wait for task completion because the protocol handler may be the task currently completing stream cleanup. External stream shutdown waits for every owned task; natural protocol-handler completion clears its handler-task reference, closes the stream, waits for the remaining internal tasks, releases its incoming reservation and removes the stream from its session. Closing a session similarly wakes a pending `connect`; the caller then observes the closed session instead of waiting until the connection timeout.
+
+Complete shutdown proceeds through the same hierarchy. After unregistering Mix handlers, the transport synchronously detaches all sessions through `takeSessions`. Each session synchronously detaches its streams through `takeStreams`, starts their shutdown operations and waits for them. The transport clears reply credentials only after all detached sessions and streams have completed local teardown.
 
 Reply credential capacity rejects a new group rather than evicting an unrelated in-flight credential. Successful recovery consumes its redundancy group. Cryptographic recovery failure preserves the remaining group opportunity, while successful cryptographic recovery followed by invalid transport decoding consumes the group because every redundant copy carries the same malformed plaintext.
 
@@ -200,7 +205,7 @@ Implemented and covered by focused or live tests:
 - mounted protocol lookup, incoming admission reservation and asynchronous handler dispatch;
 - application-facing `BufferStream` connections;
 - payload-aware chunking and bidirectional Data transfer;
-- bounded sender state, fixed receive window, ordered delivery and absolute bitmap ACKs;
+- bounded sender state, fixed receive window, ordered delivery, absolute bitmap ACKs and optional Data retransmission enabled by default;
 - application backpressure through `BufferStream`;
 - recipient SURB control reserve, serialized return sends and one-packet refill;
 - cancellation-safe local handler and flow-task shutdown;
@@ -208,9 +213,11 @@ Implemented and covered by focused or live tests:
 
 Not yet implemented:
 
-- Data retransmission timers, retry limits and RTT/RTO selection;
+- Data retransmission retry limits and RTT/RTO selection;
 - ACK send retry and optional delayed-ACK batching;
 - a persist probe when all receive-window updates are lost;
+- proactive SURB supply, numbered supply acknowledgements and bounded supply credit;
+- terminal SURB starvation recovery through an initiator-side status probe;
 - `CloseStream`, `ResetStream`, `Disconnect` and `ResetSession` processing;
 - runtime session limits and complete peer-drop cleanup;
 - authenticated Mix service discovery and destination record lifecycle;

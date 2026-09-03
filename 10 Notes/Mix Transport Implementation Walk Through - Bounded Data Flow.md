@@ -4,6 +4,7 @@ related:
   - "[[Mix Transport Design Specification]]"
   - "[[Mix Transport Implementation Walk Through - Application Connection and Protocol Dispatch]]"
   - "[[Mix Transport Implementation Walk Through - Reply Credential Store]]"
+  - "[[Mix Transport SURB Replenishment Strategy]]"
 ---
 This walkthrough follows application bytes through an established `TransportStream`. The forward path begins when the session initiator writes to the stream, divides the byte sequence into Sphinx-sized transport frames and sends those frames to the session recipient. The recipient restores the ordered byte stream, exposes the bytes to the mounted libp2p protocol and acknowledges the received sequences. The walkthrough then follows the reverse path, where the recipient sends Data and ACK frames through SURB groups supplied by the initiator. Because every reverse frame consumes one group, the recipient must replenish that supply before it loses its final return path.
 
@@ -14,7 +15,7 @@ The implementation is divided across four modules:
 - `sessions.nim` owns the recipient's SURB groups, refill state and the lock that serializes return sends within one session.
 - `transport.nim` connects the standard libp2p `Connection` methods to those state machines. The module selects forward Mix delivery for frames sent by the session initiator and SURB delivery for frames sent by the session recipient.
 
-The current implementation bounds memory, propagates application backpressure and retries a SURB refill while the recipient still has a group with which to send another request. It does not yet retransmit lost Data or probe a stalled receive window. The state introduced here is the basis for those remaining reliability mechanisms.
+The current implementation bounds memory, propagates application backpressure, retransmits unacknowledged Data and retries a SURB refill while the recipient still has a group with which to send another request. Data retransmission is enabled by default and can be disabled when constructing `MixTransport`. The transport does not yet probe a stalled receive window when every ACK carrying the advanced window has been lost.
 
 ## The State Behind One Virtual Connection
 
@@ -24,7 +25,9 @@ The receiver accepts Data sequence numbers only within a fixed-size receive wind
 
 Each ACK reports the receiver's current receive base to the sender. The sender stores the most recently reported value in `remoteReceiveBase`. The local `receiveBase` therefore describes this endpoint's incoming Data, while `remoteReceiveBase` records how far the other endpoint has progressed when passing Data sent by this endpoint into its `BufferStream`. The sender combines `remoteReceiveBase` with the receive-window size to determine the highest sequence number that the receiver currently permits.
 
-The outbound part of a stream records `nextOutboundSequence`, `remoteReceiveBase`, and the payloads that have been submitted but not acknowledged. The outbound part also owns an `AsyncEvent` named `sendStateChanged`. An application writer waits on `sendStateChanged` when the stream cannot allocate another sequence. Applying a received ACK signals `sendStateChanged` after removing acknowledged payloads or advancing `remoteReceiveBase`. Removing a chunk that could not be submitted and closing the stream also signal `sendStateChanged`.
+The outbound part of a stream records `nextOutboundSequence`, `remoteReceiveBase`, and the chunks that have been submitted but not acknowledged. Each retained `OutboundChunk` contains the payload and an optional retransmission deadline. The deadline is absent while the initial transmission or a retransmission is being submitted. After submission completes, the transport sets the next deadline unless an ACK has already removed the chunk.
+
+The outbound part owns two events. An application writer waits on `sendStateChanged` when the stream cannot allocate another sequence. Applying a received ACK signals `sendStateChanged` after removing acknowledged chunks or advancing `remoteReceiveBase`. Removing a chunk that could not be submitted and closing the stream also signal `sendStateChanged`. The retransmission task waits on `retransmissionStateChanged` when no deadline exists or when the next deadline is still in the future. Scheduling a deadline, removing an acknowledged chunk and closing the stream signal `retransmissionStateChanged`, causing the task to inspect the current table state again.
 
 The inbound part records `receiveBase`, a bitmap describing received positions at and above `receiveBase`, and the out-of-order payloads retained inside the receive window. Retaining a payload means inserting the payload into `pendingInbound` under its sequence number and setting the corresponding bit in the acknowledgement bitmap. The payload remains in `pendingInbound` until all preceding sequences have been passed to `BufferStream` and the payload becomes the next one eligible for ordered delivery.
 
@@ -46,8 +49,9 @@ TransportStream* = ref object of BufferStream
 
   nextOutboundSequence: SequenceNumber
   remoteReceiveBase: SequenceNumber
-  pendingOutbound: Table[SequenceNumber, seq[byte]]
+  pendingOutbound: Table[SequenceNumber, OutboundChunk]
   sendStateChanged: AsyncEvent
+  retransmissionStateChanged: AsyncEvent
 
   receiveBase: SequenceNumber
   acknowledgementBitmap: seq[byte]
@@ -58,15 +62,16 @@ TransportStream* = ref object of BufferStream
 
 The outbound and inbound state describe different directions of the same bidirectional stream. `pendingOutbound` contains chunks sent by this endpoint and awaiting acknowledgement. `pendingInbound` contains chunks received from the remote endpoint but not yet passed in order into this endpoint's `BufferStream`.
 
-The three events carry notifications rather than the associated state. After waking, a task checks the corresponding counters, tables or bitmap again. A notification means "check again," not "capacity definitely exists" or "a particular chunk is definitely available." The waiting loops therefore re-evaluate their conditions after every wake-up.
+The four events carry notifications rather than the associated state. After waking, a task checks the corresponding counters, tables or bitmap again. A notification means "check again," not "capacity definitely exists" or "a particular chunk is definitely available." The waiting loops therefore re-evaluate their conditions after every wake-up.
 
 Construction starts both sequence spaces at `1` and allocates the fixed bitmap:
 
 ```nim
 nextOutboundSequence: 1,
 remoteReceiveBase: 1,
-pendingOutbound: initTable[SequenceNumber, seq[byte]](),
+pendingOutbound: initTable[SequenceNumber, OutboundChunk](),
 sendStateChanged: newAsyncEvent(),
+retransmissionStateChanged: newAsyncEvent(),
 receiveBase: 1,
 acknowledgementBitmap: newSeq[byte](AckBitmapBytes),
 pendingInbound: initTable[SequenceNumber, seq[byte]](),
@@ -74,7 +79,7 @@ dataAvailable: newAsyncEvent(),
 shouldSendAck: newAsyncEvent(),
 ```
 
-`configureStream` installs the callback used by `TransportStream.write` and starts one ordered-delivery task and one acknowledgement task:
+`configureStream` installs the callback used by `TransportStream.write` and starts one ordered-delivery task and one acknowledgement task. When `enableDataRetransmissions` is true, `configureStream` also starts the stream's retransmission task:
 
 ```nim
 proc configureStream(
@@ -85,11 +90,13 @@ proc configureStream(
   ): Future[void] {.async: (raw: true, raises: [CancelledError, LPStreamError]).} =
     self.writeStream(session, stream, move(data))
   stream.setWriteHandler(writeHandler)
-  self.streamTasks.trackFut(runInboundDelivery(stream))
-  self.streamTasks.trackFut(runAcknowledgements(self, session, stream))
+  stream.trackStreamTask(runInboundDelivery(stream))
+  stream.trackStreamTask(runAcknowledgements(self, session, stream))
+  if self.dataRetransmissionsEnabled:
+    stream.trackStreamTask(runRetransmissions(self, session, stream))
 ```
 
-An outbound stream is configured after its `StreamAck` arrives. At the recipient, an inbound stream is configured immediately before it is established and passed to the mounted protocol. A rejected stream never starts these tasks.
+An outbound stream is configured after its `StreamAck` arrives. At the recipient, an inbound stream is configured immediately before it is established and passed to the mounted protocol. A rejected stream never starts these tasks. The tasks are stored on the stream whose state and events they use; they are not stored in a transport-wide task collection.
 
 ## 1. An Application Write Enters MixTransport
 
@@ -279,7 +286,7 @@ proc writeStream(
   )
 ```
 
-The `reserveOutbound` implementation first repeats the capacity check, then increments the sequence and retains the payload:
+The `reserveOutbound` implementation first repeats the capacity check, then increments the sequence and retains the payload. The new chunk has no retransmission deadline because its initial submission has not completed:
 
 ```nim
 proc reserveOutbound*(
@@ -291,11 +298,12 @@ proc reserveOutbound*(
     return err("stream has no outbound capacity")
   let sequence = stream.nextOutboundSequence
   inc stream.nextOutboundSequence
-  stream.pendingOutbound[sequence] = payload
+  stream.pendingOutbound[sequence] =
+    OutboundChunk(payload: payload, nextRetransmissionAt: Opt.none(Moment))
   ok(sequence)
 ```
 
-The frame receives `move(chunk)`, while `pendingOutbound` retains its own payload. That retained copy is necessary for retransmission, although the retransmission timer is not implemented yet. An ACK removes it; immediate send failure calls `cancelOutbound`.
+The frame receives `move(chunk)`, while `pendingOutbound` retains its own payload for possible retransmission. An ACK removes the retained `OutboundChunk`; immediate submission failure calls `cancelOutbound`.
 
 The wire validator requires exactly the fields appropriate for `Data`:
 
@@ -311,7 +319,19 @@ proc validateFrame(
   # Validation for the remaining frame-specific fields follows.
 ```
 
-After `sendStreamFrame` accepts the frame for Mix submission, `writeStream` advances to the next slice. Submission does not mean the remote endpoint received it; `pendingOutbound` records that distinction.
+After `sendStreamFrame` accepts the frame for Mix submission, `writeStream` schedules the first retransmission deadline when Data retransmission is enabled:
+
+```nim
+(await self.sendStreamFrame(session, frame)).isOkOr:
+  stream.cancelOutbound(reservedSequence)
+  raise newException(LPStreamError, error)
+if self.dataRetransmissionsEnabled:
+  stream.scheduleOutboundRetransmission(
+    reservedSequence, self.dataRetransmissionTimeout
+  )
+```
+
+Submission does not mean that the remote endpoint received the Data. The chunk remains in `pendingOutbound` until an ACK removes it. If an ACK arrives before `sendStreamFrame` returns, the ACK removes the chunk first and `scheduleOutboundRetransmission` finds no matching entry, so the completed initial submission does not recreate acknowledged state.
 
 ## 5. Session Role Selects the Delivery Path
 
@@ -355,31 +375,9 @@ When the local endpoint is the session initiator, the initiator knows the destin
 
 When the local endpoint is the session recipient, the recipient does not have a forward destination for the anonymous initiator. The recipient submits the encoded frame through a SURB group supplied by the initiator. This path carries both response Data written by the recipient's application handler and ACKs produced after the recipient receives forward Data from the initiator.
 
-`acquireReplySend` serializes all return sends belonging to the same session. The session has one shared supply of received SURB groups, so an application response and an ACK task must not concurrently inspect and consume that supply. The `defer` releases the lock after every success or error path. Incoming `Refill` handling does not acquire this lock and can therefore add groups while this code waits.
+`acquireReplySend` serializes all return sends belonging to the same session. The session has one shared supply of received SURB groups, so an application response and an ACK task must not concurrently inspect and consume that supply. The recipient preserves a control reserve, waits for an unreserved group before sending ordinary traffic, and checks whether another refill should be requested after consuming the selected group.
 
-The call to `ensureUnreservedSurbGroup` and the later call to `requestRefill` examine the SURB supply at different points in the operation. `ensureUnreservedSurbGroup` waits until the current frame may consume a group without touching the control reserve. `requestRefill` sends nothing when the session has more groups than the refill low-water mark or already has a refill request in flight.
-
-The code calls a SURB group unreserved when consuming that group would still leave `ReplyControlReserveGroups` groups in the session. Unreserved is not a group type or a flag stored on a group. The term describes whether the current number of groups is above the protected minimum.
-
-`ensureUnreservedSurbGroup` runs before the current frame consumes an unreserved SURB group. If the supply is already at or below the low-water mark, the helper uses `requestRefill` to consume one of the groups protected for control traffic and ask the initiator for new groups. The helper waits for the refill attempt to finish and reevaluates the queue. When a matching response contains too few valid groups to raise the queue above the reserve, the helper starts another refill request. If the supply was already above the protected minimum, the helper returns without sending or waiting.
-
-`takeUnreservedSurbGroup` removes one group only when the remaining count will be at least `ReplyControlReserveGroups`. One logical return frame consumes this complete redundancy group. `sendWithSurbGroup` submits the same payload through every SURB in the group, moving each SURB exactly once:
-
-```nim
-proc sendWithSurbGroup(
-    self: MixTransport, surbs: sink seq[SURB], payload: sink seq[byte]
-): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
-  var sent = false
-  for surb in surbs.mitems:
-    if (await self.mix.sendWithSurb(move(surb), payload)).isOk:
-      sent = true
-
-  if not sent:
-    return err("could not send through any SURB in the reply group")
-  ok()
-```
-
-Sending the frame can reduce the remaining supply to the low-water mark. The second `requestRefill` reevaluates the supply after that consumption and starts a refill for a future return frame when necessary. This second call does not wait for the refill: the current frame has already been submitted, and retaining the refill as an in-flight request allows the recipient to rebuild its SURB supply while other work continues.
+The definitions of an unreserved group, the existing pull-based refill sequence, and the intended hybrid replenishment mechanism are documented in [[Mix Transport SURB Replenishment Strategy]]. This walkthrough relies on their resulting contract: one reverse transport frame consumes one session-owned redundancy group, and Data or ACK transmission waits rather than consuming capacity protected for replenishment control.
 
 After the session recipient submits the same encoded frame through every SURB in the selected group, the explanation moves to the session initiator that receives those redundant replies. The initiator's reply credential store contains the private credentials corresponding to that SURB group. When the initiator successfully recovers the first reply, the store consumes the complete credential group because every SURB in the group carries a redundant copy of the same transport frame. If another copy arrives later, its retired SURB identifier tells the initiator that the group has already produced a valid reply, so the later copy does not enter the transport state machine again.
 
@@ -627,7 +625,7 @@ proc handleAcknowledgement(
   )
 ```
 
-The sender retains every unacknowledged Data payload in `stream.pendingOutbound`, indexed by its sequence number. The current implementation uses the number of retained entries to enforce `MaxInflightChunks`. Keeping the payload, rather than only the sequence number, also preserves the bytes that a later retransmission increment will need; automatic retransmission is not implemented yet.
+The sender retains every unacknowledged Data chunk in `stream.pendingOutbound`, indexed by its sequence number. The current implementation uses the number of retained entries to enforce `MaxInflightChunks`. Each entry retains both the payload needed for retransmission and its optional next retransmission deadline.
 
 `applyAcknowledgement` first validates the received snapshot. The bitmap must have exactly `AckBitmapBytes` bytes. `receiveBase` must not be lower than `stream.remoteReceiveBase`, because accepting an older base would move the sender's view of the receive window backwards. `receiveBase` must not be higher than `stream.nextOutboundSequence`, because the receiver cannot have advanced beyond every sequence the sender has allocated:
 
@@ -655,345 +653,84 @@ proc applyAcknowledgement*(
   stream.remoteReceiveBase = receiveBase
   if changed:
     stream.sendStateChanged.fire()
+    stream.retransmissionStateChanged.fire()
   changed
 ```
 
 Every sequence below `receiveBase` is cumulatively acknowledged, so its retained payload can be removed. For a retained sequence at or above `receiveBase`, the procedure calculates the sequence's offset inside the advertised receive window. A set bit at that offset confirms that the receiver has accepted that specific sequence even if an earlier sequence is still missing.
 
-After removing the acknowledged payloads, `applyAcknowledgement` records the new `remoteReceiveBase`. The procedure fires `sendStateChanged` when at least one payload was removed or the base advanced. Removing a payload can bring `pendingOutbound.len` below `MaxInflightChunks`. Advancing `remoteReceiveBase` moves the upper boundary of the remote receive window. Either change can make `canReserveOutbound` true and wake a writer waiting in `waitForOutboundCapacity`.
+After removing the acknowledged chunks, `applyAcknowledgement` records the new `remoteReceiveBase`. The procedure fires `sendStateChanged` when at least one chunk was removed or the base advanced. Removing a chunk can bring `pendingOutbound.len` below `MaxInflightChunks`. Advancing `remoteReceiveBase` moves the upper boundary of the remote receive window. Either change can make `canReserveOutbound` true and wake a writer waiting in `waitForOutboundCapacity`. The procedure also fires `retransmissionStateChanged` so that the retransmission task recalculates its earliest deadline after acknowledged entries have disappeared.
 
 `applyAcknowledgement` returns `false` for an invalid snapshot and for a valid snapshot that does not change the sender's state. `handleAcknowledgement` currently ignores that return value because both cases require no further action.
 
-## 12. Recipient Data and ACKs Share the SURB Supply
+## 12. Unacknowledged Data Is Retransmitted
 
-This section returns to the session recipient. Unlike the session initiator, the recipient cannot address the anonymous initiator through the forward Mix path. Every frame sent from the recipient to the initiator must therefore consume a SURB group previously supplied by the initiator.
-
-Several asynchronous tasks belonging to the same session can try to use that shared supply. An application protocol handler can write response Data on one or more streams. Each established stream also has a `runAcknowledgements` task that sends ACKs for Data received on that stream. All of these paths eventually call the recipient branch of `sendStreamFrame`, and all of them remove groups from `session.receivedSurbGroups`.
-
-`sendStreamFrame` calls `acquireReplySend` before examining or consuming the session's SURB supply. The matching `defer` guarantees that every return path releases the lock:
+`newMixTransport` enables Data retransmission by default and uses a fixed 30-second timeout. A caller can disable this behavior explicitly without changing ACK processing or flow control:
 
 ```nim
-proc acquireReplySend*(
-    session: TransportSession
-): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
-  session.replySendLock.acquire()
-
-proc releaseReplySend*(session: TransportSession) =
-  try:
-    session.replySendLock.release()
-  except AsyncLockError as exc:
-    raiseAssert "session reply-send lock was not held: " & exc.msg
+proc newMixTransport*(
+    mix: MixProtocol,
+    connectTimeout = DefaultConnectTimeout,
+    streamOpenTimeout = DefaultStreamOpenTimeout,
+    refillRequestTimeout = DefaultRefillRequestTimeout,
+    dataRetransmissionTimeout = DefaultDataRetransmissionTimeout,
+    enableDataRetransmissions = true,
+    refillResponseLifetime = DefaultRefillResponseLifetime,
+    maxOutstandingRefillRequests = DefaultMaxOutstandingRefillRequests,
+): MixTransport
 ```
 
-`acquireReplySend` contains no work before or after lock acquisition. Declaring the wrapper as raw returns the future produced by `AsyncLock.acquire` directly and avoids an additional async state machine. Cancellation therefore reaches the actual pending lock acquisition.
+When `enableDataRetransmissions` is false, `configureStream` does not start `runRetransmissions`, and `writeStream` does not assign retransmission deadlines. The sender still retains each outbound chunk until it is acknowledged because `pendingOutbound` also enforces the in-flight bound and prevents the sender from outrunning the receiver's window.
 
-The lock covers one complete recipient-side send operation: checking whether a refill must be requested, waiting until a group is available above the protected minimum, removing that group, submitting the Data or ACK frame, and checking the remaining supply afterward. These steps contain `await` points. Serializing the complete sequence prevents another Data or ACK task from making a competing refill or group-removal decision while the first send is suspended.
-
-`replySendLock` belongs to one `TransportSession`. Sends belonging to a different session use a different lock and can continue concurrently. Incoming `Refill` handling deliberately does not acquire `replySendLock`: a task holding the lock may be waiting for new groups, and the arriving `Refill` must be able to add those groups and wake that task.
-
-## 13. The Recipient Preserves a Control Reserve
-
-The recipient faces a circular dependency when its SURB supply becomes low: obtaining more SURBs requires sending a `RefillRequest` to the initiator, but sending that request itself requires a SURB group. If Data and ACK frames were allowed to consume the final groups, the recipient could lose the only mechanism available for requesting replacements.
-
-The transport prevents that state by maintaining a control reserve. The control reserve is the minimum number of groups that Data and ACK frames must leave in `session.receivedSurbGroups`. The groups have identical representations; no group carries a reserved flag. A group is called unreserved only when removing one group at the current queue length would still leave the configured minimum in the queue.
-
-`sessions.nim` currently sets the control reserve to two groups and uses the same value as the refill low-water mark:
+When retransmission is enabled, `runRetransmissions` belongs to the same `TransportStream` as the ACK and ordered-delivery tasks. The task first clears its notification event and asks `takeDueOutboundRetransmission` for the due chunk with the earliest deadline:
 
 ```nim
-const
-  ReplyControlReserveGroups* = 2
-  ReplyRefillLowWatermarkGroups* = ReplyControlReserveGroups
-```
+proc runRetransmissions(
+    self: MixTransport, session: TransportSession, stream: TransportStream
+) {.async: (raises: [CancelledError]).} =
+  while not stream.closed:
+    stream.clearRetransmissionStateChanged()
 
-`takeUnreservedSurbGroup` enforces this rule. With three groups in the queue, the procedure may remove one and leave the two-group reserve. With two groups in the queue, the procedure returns an error and leaves both groups available for control traffic:
-
-```nim
-proc takeUnreservedSurbGroup*(session: TransportSession): Result[seq[SURB], string] =
-  if session.receivedSurbGroups.len <= ReplyControlReserveGroups:
-    return err("session reply capacity is reserved for control traffic")
-  ok(session.receivedSurbGroups.popFirst())
-```
-
-When the queue contains only the reserve, a recipient-side Data or ACK send cannot proceed immediately. The transport must request a refill, wait for that refill attempt to finish, and then inspect the queue again. Inspecting the queue again is important because a refill can contain fewer valid groups than requested.
-
-Each recipient-side `TransportSession` owns a manual-reset `AsyncEvent` named `replyCapacityStateChanged`. A task waiting for an unreserved group uses this event as a notification that the SURB queue or refill state has changed. The task must inspect the group count after waking; the notification does not guarantee that an unreserved group is available.
-
-```nim
-proc clearReplyCapacityStateChanged*(session: TransportSession) =
-  session.replyCapacityStateChanged.clear()
-
-proc waitForReplyCapacityStateChange*(
-    session: TransportSession
-): Future[void] {.async: (raw: true, raises: [CancelledError]).} =
-  session.replyCapacityStateChanged.wait()
-```
-
-`replyCapacityStateChanged` tells the blocked send to inspect the stored SURB groups again. `addReceivedSurbGroups` fires the event after appending at least one group. Section 16 shows why accepting a refill response also fires the event before the response's valid groups are appended.
-
-The recipient adds newly received groups through `addReceivedSurbGroups`:
-
-```nim
-proc addReceivedSurbGroups*(
-    session: TransportSession, groups: sink seq[seq[SURB]]
-): Result[void, string] =
-  if session.role != SessionRole.Recipient:
-    return err("only recipient sessions can store received SURB groups")
-  for group in groups:
-    if group.len == 0:
-      return err("received SURB groups must not be empty")
-
-  for group in groups.mitems:
-    session.receivedSurbGroups.addLast(move(group))
-  if groups.len > 0:
-    if session.receivedSurbGroups.len > ReplyRefillLowWatermarkGroups:
-      session.nextRefillRequestAt = Opt.none(Moment)
-    session.replyCapacityStateChanged.fire()
-  ok()
-```
-
-When the accumulated supply rises above the low-water mark, another refill request is no longer needed. The group-count check therefore removes the scheduled request deadline. If later reverse traffic reduces the supply again, the absence of a deadline allows proactive replenishment to start immediately.
-
-The reserve does not prevent control traffic from consuming a protected group. The next section shows that `requestRefill` intentionally uses `takeReceivedSurbGroup`, which can remove a group from the reserve, because restoring the SURB supply is the purpose for which the reserve exists.
-
-## 14. A Refill Attempt Uses One Reserved Group
-
-Section 13 ended with a recipient-side Data or ACK task that cannot proceed while the SURB queue contains only the control reserve. Before that task can send its frame, the recipient must use one reserved group to ask the initiator for replacement groups. If the request or its response is lost, the recipient must use a different group for the next attempt because a SURB can be consumed only once.
-
-`ensureUnreservedSurbGroup` coordinates refill requests while a reverse Data or ACK operation is waiting for capacity. The procedure does not distinguish an initial request from a retry. On every loop iteration, `requestRefill` sends another request only when supply remains low and the scheduled time for another attempt has arrived. If another request is not yet due, the procedure waits for either a response or the remaining delay:
-
-```nim
-proc ensureUnreservedSurbGroup(
-    self: MixTransport, session: TransportSession
-): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
-  while session.receivedSurbGroupCount <= ReplyControlReserveGroups:
-    session.clearReplyCapacityStateChanged()
-    (await self.requestRefill(session)).isOkOr:
-      return err(error)
-    if session.receivedSurbGroupCount <= ReplyControlReserveGroups:
-      let waitTime = session.timeUntilNextRefillRequest()
+    var retransmission = stream.takeDueOutboundRetransmission().valueOr:
+      let deadline = stream.earliestRetransmissionDeadline().valueOr:
+        await stream.waitForRetransmissionStateChange()
+        continue
+      let waitTime = deadline - Moment.now()
       if waitTime > ZeroDuration:
-        discard await session.waitForReplyCapacityStateChange().withTimeout(waitTime)
-  ok()
-```
-
-The wait can finish for two reasons. A refill response can change the SURB supply and signal `replyCapacityStateChanged`, or the remaining delay can expire without a response. The loop then evaluates the current group count and request schedule again. A response containing enough valid groups lets the loop finish. A response containing too few valid groups removes the delay and allows another request immediately. If no response arrives, reaching `nextRefillRequestAt` allows another request.
-
-Chronos `AsyncEvent` remains signalled until it is cleared. If a response arrives while `requestRefill` is suspended, `acceptRefillResponse` and `addReceivedSurbGroups` signal `replyCapacityStateChanged`, and the following wait returns immediately. The retry mechanism is demand-driven: time is measured from the preceding request, but no background task wakes solely to submit another request. A proactive refill submitted after an earlier reverse send is reconsidered when another reverse operation needs capacity.
-
-`nextRefillRequestAt` stores the earliest time at which another request may be submitted while supply remains low. This scheduling deadline is separate from the lifetime of any response identifier. `refillRequestDue` combines the supply and scheduling checks:
-
-```nim
-func refillRequestDue*(session: TransportSession, now: Moment = Moment.now()): bool =
-  if session.role != SessionRole.Recipient or
-      session.receivedSurbGroups.len > ReplyRefillLowWatermarkGroups:
-    return false
-  let nextRefillRequestAt = session.nextRefillRequestAt.valueOr:
-    return true
-  nextRefillRequestAt <= now
-
-func timeUntilNextRefillRequest*(
-    session: TransportSession, now: Moment = Moment.now()
-): Duration =
-  let nextRefillRequestAt = session.nextRefillRequestAt.valueOr:
-    return ZeroDuration
-  if nextRefillRequestAt <= now:
-    ZeroDuration
-  else:
-    nextRefillRequestAt - now
-```
-
-When `nextRefillRequestAt` is absent, low supply permits a request immediately. After a request is prepared, `scheduleNextRefillRequest` stores `now + refillRequestTimeout`. A reverse operation arriving partway through the timeout waits only for the remaining duration rather than starting a new full timeout.
-
-`requestRefill` contains the one send path used for every attempt. When `refillRequestDue` returns true, the procedure calls `registerRefillRequest`, which allocates a new monotonically increasing `refillRequestId` and records the deadline until which the corresponding response will be accepted:
-
-```nim
-proc requestRefill(
-    self: MixTransport, session: TransportSession
-): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
-  if not session.refillRequestDue:
-    return ok()
-
-  let refillRequestId = session.registerRefillRequest().valueOr:
-    return err(error)
-
-  var replyGroup = session.takeReceivedSurbGroup().valueOr:
-    session.cancelRefillRequest(refillRequestId)
-    return err("could not reserve a SURB group for refill: " & error)
-  let request = MixTransportFrame(
-    version: MixTransportVersion,
-    sessionId: session.sessionId,
-    kind: FrameKind.RefillRequest,
-    refillRequestId: Opt.some(refillRequestId),
-    requestedGroups: Opt.some(DefaultRefillGroups.uint32),
-  ).encode().valueOr:
-    session.cancelRefillRequest(refillRequestId)
-    return err("could not encode RefillRequest: " & error)
-  session.scheduleNextRefillRequest(self.refillRequestTimeout)
-  (await self.sendWithSurbGroup(replyGroup, request)).isOkOr:
-    session.cancelRefillRequest(refillRequestId)
-    return err("could not send RefillRequest: " & error)
-  ok()
-```
-
-The deadline is scheduled before `sendWithSurbGroup` yields. A response can arrive while that asynchronous submission is suspended. Recording the deadline first allows `acceptRefillResponse` to remove it without the resumed send later restoring an obsolete delay. If submission fails, `cancelRefillRequest` removes both the response identifier and the scheduled delay.
-
-`registerRefillRequest` records each individual attempt in `outstandingRefillRequests`. The table maps a `refillRequestId` to the deadline after which a response carrying that identifier is no longer accepted. Keeping several identifiers lets a delayed response from an earlier attempt contribute its SURBs after a later retry has already been submitted:
-
-```nim
-proc registerRefillRequest*(
-    session: TransportSession, now: Moment = Moment.now()
-): Result[RefillRequestId, string] =
-  # Role, supply, expiry and capacity checks precede this excerpt.
-  let refillRequestId = session.nextRefillRequestId.valueOr:
-    return err("refill request identifier space is exhausted")
-  session.nextRefillRequestId =
-    if refillRequestId == RefillRequestId.high:
-      Opt.none(RefillRequestId)
-    else:
-      Opt.some(refillRequestId + 1)
-  session.outstandingRefillRequests[refillRequestId] =
-    now + session.refillResponseLifetime
-  ok(refillRequestId)
-```
-
-The response-tracking table has a configurable maximum of 1,024 entries by default. Before registering a request, the session removes expired entries. If the table remains full, the session removes the entry with the earliest response deadline and records the new request. This policy bounds correlation state without terminating a working session. A response for the removed identifier is ignored if it eventually arrives; responses for all identifiers that remain in the table are still accepted independently.
-
-After registration, `requestRefill` intentionally calls `takeReceivedSurbGroup` rather than `takeUnreservedSurbGroup`. The call can remove a group from the protected minimum because requesting replacement groups is the control operation for which the reserve exists:
-
-```nim
-proc takeReceivedSurbGroup*(session: TransportSession): Result[seq[SURB], string] =
-  if session.receivedSurbGroups.len == 0:
-    return err("session has no received SURB groups")
-  ok(session.receivedSurbGroups.popFirst())
-```
-
-`DefaultRefillGroups` equals `MaxRefillGroupsPerFrame`, currently two. A single `Refill` frame can therefore carry every group requested by one `RefillRequest`. The recipient rebuilds a larger supply through repeated two-group requests rather than using a multipart response.
-
-If no group is available, frame encoding fails, or every redundant SURB submission fails immediately, `requestRefill` calls `cancelRefillRequest`. The procedure removes the identifier allocated for the failed local attempt, removes the delay before another request and wakes a task waiting for the reply-capacity state to change:
-
-```nim
-proc cancelRefillRequest*(session: TransportSession, refillRequestId: RefillRequestId) =
-  session.outstandingRefillRequests.del(refillRequestId)
-  session.nextRefillRequestAt = Opt.none(Moment)
-  session.replyCapacityStateChanged.fire()
-```
-
-After `takeReceivedSurbGroup` removes a group, the implementation does not put that group back into the queue on an error. Reusing the group would be unsafe after any SURB submission was attempted. If repeated timeouts consume every remaining group before a valid response arrives, the next retry cannot be sent and the blocked Data or ACK operation returns an error.
-
-The recipient branch of `sendStreamFrame`, shown in full in Section 5, calls `ensureUnreservedSurbGroup` before removing the group used by the current Data or ACK frame. After submitting that frame, the same branch calls `requestRefill` again. This second call proactively starts a refill when consuming the current frame's group brought the queue back to the low-water mark. The second call does not wait, because the current Data or ACK frame has already been submitted.
-
-The recipient also calls `requestRefill` after successfully submitting `StreamAck` for a new inbound stream. `sendStreamResponse` has consumed a group for that acknowledgement, so the later call proactively replenishes the session. Before publishing `StreamAck`, the recipient configures and establishes the stream so Data sent after the first redundant acknowledgement copy enters the bounded receive path. The relevant context is the successful tail of `handleOpenStream`:
-
-```nim
-proc handleOpenStream(
-    self: MixTransport, frame: MixTransportFrame
-): Future[void] {.async: (raises: [CancelledError]).} =
-  # Session lookup, SURB import, protocol lookup and stream admission precede
-  # this successful setup path.
-  self.configureStream(session, stream)
-  stream.establish()
-  if not await self.sendStreamResponse(session, stream.streamId, FrameKind.StreamAck):
-    return
-
-  keepStream = true
-  keepReservation = true
-  self.handlerTasks.trackFut(runProtocolHandler(session, stream, protocol))
-  discard await self.requestRefill(session)
-```
-
-The `keepStream` and `keepReservation` assignments transfer cleanup responsibility to `runProtocolHandler`. They occur immediately after successful ACK submission and before the next cancellable operation, because the initiator may already be using the stream. Their complete lifecycle belongs to [[Mix Transport Implementation Walk Through - Application Connection and Protocol Dispatch]]. In the bounded-flow path, the final `requestRefill` call is the proactive replenishment step after the acknowledgement consumes a group.
-
-## 15. The Initiator Creates the New Return Paths
-
-The explanation now moves from the recipient that submitted `RefillRequest` to the session initiator that receives it. Because the request travels from recipient to initiator, it arrives as a raw SURB reply. The initiator's reply credential store recovers the transport payload, `handleRawSurbReply` decodes the frame, and `handleReplyFrame` dispatches `RefillRequest` only when the referenced session belongs to the initiator and is established.
-
-`handleRefillRequest` obtains the real destination from the initiator-side session. The procedure asks `createReplyGroups` to create the requested number of SURB groups. For every public SURB placed in `prepared.encoded`, `createReplyGroups` registers the corresponding private reply credential in `self.replyCredentials` under the same transport session. The public SURBs will be sent to the recipient; the private credentials must remain at the initiator so that later replies sent through those SURBs can be recovered:
-
-```nim
-proc handleRefillRequest(
-    self: MixTransport, session: TransportSession, frame: MixTransportFrame
-): Future[void] {.async: (raises: [CancelledError]).} =
-  let destination = session.destination.valueOr:
-    return
-  let prepared = self.createReplyGroups(
-    destination,
-    session.sessionId,
-    frame.requestedGroups.get().int,
-    DefaultRefillSurbRedundancy,
-  ).valueOr:
-    return
-
-  let refill = MixTransportFrame(
-    version: MixTransportVersion,
-    sessionId: session.sessionId,
-    kind: FrameKind.Refill,
-    refillRequestId: frame.refillRequestId,
-    surbGroups: prepared.encoded,
-  )
-  (await self.sendStreamFrame(session, refill)).isOkOr:
-    self.retireReplyGroups(prepared.credentials)
-    return
-```
-
-Each group currently contains two redundant SURBs because `DefaultRefillSurbRedundancy` is two. The `Refill` itself travels from initiator to recipient through the regular forward Mix path selected by the initiator branch of `sendStreamFrame`.
-
-The refill response always fits in one transport frame, so the wire format does not carry multipart indexes. If submitting that frame fails immediately, `retireReplyGroups` consumes the newly registered private credentials because the corresponding public SURBs did not reach the recipient and cannot produce usable replies.
-
-## 16. The Recipient Accepts Every Tracked Refill Response Once
-
-The explanation returns to the session recipient. The forward `Refill` arrives through the Mix delivery handler registered for `MixTransportCodec`. `handleDelivery` decodes the transport frame and dispatches `FrameKind.Refill` to `handleRefill`.
-
-The local encoder and the inbound decoder apply different SURB checks for a deliberate reason. `MixTransportFrame.encode` uses strict validation and refuses to serialize an empty group or a SURB byte string whose size is not `SurbSize`; locally generated traffic must always be well formed. `MixTransportFrame.decode` still validates the frame size, frame kind and field relationships, but leaves the contents of each received `SurbGroup` for `decodeSurbs`. Without this separation, one malformed group would make the wire decoder reject the complete `Refill` before `handleRefill` could retain the other groups.
-
-`handleRefill` first resolves an established recipient-side session. Before decoding any groups, the procedure passes the frame's `refillRequestId` to `acceptRefillResponse`. This operation purges expired entries and accepts the response only when its identifier remains in `outstandingRefillRequests`. Acceptance removes the identifier before returning, so a duplicate response carrying the same public SURBs cannot add them twice:
-
-```nim
-proc acceptRefillResponse*(
-    session: TransportSession,
-    refillRequestId: RefillRequestId,
-    now: Moment = Moment.now(),
-): bool =
-  discard session.purgeExpiredRefillRequests(now)
-  if not session.outstandingRefillRequests.hasKey(refillRequestId):
-    return false
-  session.outstandingRefillRequests.del(refillRequestId)
-  session.nextRefillRequestAt = Opt.none(Moment)
-  session.replyCapacityStateChanged.fire()
-  true
-```
-
-The table can contain identifiers from several attempts made while the supply remained low. Accepting one response does not remove the other identifiers. If a response for a later attempt arrives first and a delayed response for an earlier attempt arrives afterward, both responses contribute their groups, provided that each identifier is still tracked and has not expired. This behavior is important because the recipient spent a different one-use SURB group on every attempt; discarding the useful return paths from a valid late response would waste that capacity.
-
-`acceptRefillResponse` removes `nextRefillRequestAt` because a received response ends the delay assigned to the corresponding attempt. If decoding does not raise the supply above the low-water mark, the absent deadline lets `ensureUnreservedSurbGroup` send another request immediately. The procedure also fires `replyCapacityStateChanged` before any SURB group has been decoded. A response containing no valid group must still wake the blocked send. Chronos uses cooperative scheduling, so `handleRefill` continues through group decoding and `addReceivedSurbGroups` without yielding; the waiting task observes the completed synchronous state changes when it resumes.
-
-After the identifier is accepted, `handleRefill` decodes each attached group independently. A malformed group is skipped, while every valid group is retained in `decodedGroups`. Retaining valid groups is preferable to rejecting the complete frame because even one valid group can preserve the recipient's ability to send another refill request. The complete handler is:
-
-```nim
-proc handleRefill(self: MixTransport, frame: MixTransportFrame) {.gcsafe, raises: [].} =
-  let session = self.sessions.get(frame.sessionId).valueOr:
-    return
-  if session.role != SessionRole.Recipient or session.state != SessionState.Established:
-    return
-
-  let refillRequestId = frame.refillRequestId.get()
-  if not session.acceptRefillResponse(refillRequestId):
-    return
-
-  var decodedGroups = newSeqOfCap[seq[SURB]](frame.surbGroups.len)
-  for encodedGroup in frame.surbGroups:
-    let group = encodedGroup.decodeSurbs().valueOr:
+        discard await stream.waitForRetransmissionStateChange().withTimeout(waitTime)
       continue
-    decodedGroups.add(group)
-  discard session.addReceivedSurbGroups(decodedGroups)
 ```
 
-The final `addReceivedSurbGroups` call appends every successfully decoded group. When the accumulated queue grows above the low-water mark, the blocked Data or ACK operation can consume one unreserved group. When the queue still contains only the reserve, `nextRefillRequestAt` remains absent and `ensureUnreservedSurbGroup` submits another request. A short response and a valid late response can therefore combine their groups until the session has enough reverse-send capacity.
+If no retained chunk has a deadline, the task waits until initial Data submission schedules one, an ACK changes the table, or stream closure requests cancellation. If the earliest deadline is in the future, the task waits until either that deadline expires or `retransmissionStateChanged` reports an earlier state change. In both cases the loop inspects `pendingOutbound` again instead of assuming that the state which caused the wake-up is still current.
 
-## 17. Teardown Wakes Every Flow Task
+`takeDueOutboundRetransmission` copies the selected payload for the asynchronous send and clears that chunk's deadline. Clearing the deadline marks that a retransmission is currently being submitted and prevents the loop from selecting the same chunk again concurrently. The task constructs another Data frame with the original stream ID, sequence number and payload, then submits the frame through the same session-role-dependent path used by the initial send:
 
-An established stream owns three operations that may be suspended indefinitely while the stream is idle or blocked: `runInboundDelivery` may wait on `dataAvailable`, `runAcknowledgements` may wait on `shouldSendAck`, and an application writer may wait on `sendStateChanged` because the in-flight or remote-window limit has been reached. Closing the stream must wake all three operations so that none remains suspended after shutdown.
+```nim
+let frame = MixTransportFrame(
+  version: MixTransportVersion,
+  sessionId: session.sessionId,
+  kind: FrameKind.Data,
+  streamId: Opt.some(stream.streamId),
+  sequence: Opt.some(retransmission.sequence),
+  payload: Opt.some(move(retransmission.payload)),
+)
+let sent = await self.sendStreamFrame(session, frame)
+stream.scheduleOutboundRetransmission(
+  retransmission.sequence, self.dataRetransmissionTimeout
+)
+```
 
-`TransportStream.closeImpl` fires each event before delegating to `BufferStream.closeImpl`:
+The next fixed deadline is scheduled after the submission finishes, whether that submission succeeded or returned an error. A transient local send failure therefore does not silently abandon an unacknowledged chunk. There is currently no retry-count limit: retransmission continues until an ACK removes the chunk or the stream closes.
+
+An ACK can arrive while `sendStreamFrame` is suspended. In that case `applyAcknowledgement` removes the chunk from `pendingOutbound`. The later call to `scheduleOutboundRetransmission` changes an entry only when that entry still exists, so completion of the overlapping retransmission cannot restore an acknowledged chunk. The receiver may observe the already-submitted duplicate; `receiveData` suppresses the duplicate and requests another absolute ACK snapshot.
+
+## 13. Stream Shutdown Cancels and Waits for Its Tasks
+
+An established stream owns an ordered Data-delivery task and an ACK task. An accepted inbound application stream also owns the protocol-handler invocation operating on that stream. `runInboundDelivery` may wait on `dataAvailable`, `runAcknowledgements` may wait on `shouldSendAck`, and an application writer may wait on `sendStateChanged` because the in-flight or remote-window limit has been reached.
+
+Firing the events is sufficient when a task is idle at one of those waits, but it does not stop a task that has moved into another asynchronous operation. For example, `runAcknowledgements` may be inside `sendStreamFrame`, waiting for a session SURB refill. The ACK task is no longer waiting on `shouldSendAck`, so firing that event cannot terminate it. `TransportStream` therefore owns explicit references to its internal `streamTasks` and optional `handlerTask`.
+
+`TransportStream.closeImpl` fires the ordinary state events, requests cancellation of every owned task and then delegates to `BufferStream.closeImpl`:
 
 ```nim
 method closeImpl*(
@@ -1002,12 +739,30 @@ method closeImpl*(
   stream.dataAvailable.fire()
   stream.shouldSendAck.fire()
   stream.sendStateChanged.fire()
+  stream.resolved.fire()
+  stream.streamTasks.cancelSoon()
+  if not stream.handlerTask.isNil:
+    stream.handlerTask.cancelSoon()
   procCall BufferStream(stream).closeImpl()
 ```
 
-`BufferStream.closeImpl` marks the stream closed. After the fired events resume their waiters, the delivery and ACK loops observe `stream.closed` and return. A writer resumed through `sendStateChanged` raises `LPStreamError` instead of allocating another outbound sequence.
+The inherited `LPStream.close` operation marks the stream closed before dispatching to `closeImpl`. The fired events allow ordinary waiters to observe that state, while explicit cancellation reaches a task suspended deeper inside Mix or SURB processing. `closeImpl` requests cancellation but does not wait: the protocol handler may be the task currently completing stream cleanup, and a task must not wait for itself.
 
-Stopping the complete transport begins by unregistering both Mix handlers, preventing new forward deliveries and raw SURB replies from entering MixTransport. `stop` then cancels and waits for application protocol-handler tasks and per-stream delivery and ACK tasks before clearing reply credentials and session state:
+External teardown uses `TransportStream.shutdown`. The procedure retains a local reference to `handlerTask`, closes the stream and then waits for the internal tasks and handler to finish. The local reference remains valid if handler cleanup clears the field while cancellation is being processed:
+
+```nim
+proc shutdown*(stream: TransportStream): Future[void] {.async: (raises: []).} =
+  let handlerTask = stream.handlerTask
+  await stream.close()
+  await stream.cancelAndWaitForStreamTasks()
+  if not handlerTask.isNil:
+    await noCancel handlerTask.cancelAndWait()
+  stream.handlerTask = nil
+```
+
+When `runProtocolHandler` finishes naturally, it clears `handlerTask` before closing the stream and waits only for the internal `streamTasks`. The handler therefore never waits for its own future.
+
+Stopping the complete transport follows the ownership hierarchy. After unregistering both Mix handlers, `takeSessions` synchronously detaches every session from the store. Each session synchronously detaches its streams through `takeStreams`; session shutdown then starts every stream shutdown and waits for all of them. No table iterator survives across an `await`, and a handler completing during cancellation cannot mutate the container currently being iterated. After all detached sessions finish, the transport clears reply credentials:
 
 ```nim
 proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError]).} =
@@ -1016,12 +771,12 @@ proc stop*(self: MixTransport): Future[void] {.async: (raises: [CancelledError])
 
   self.mix.unregisterRawSurbReplyHandler()
   self.mix.unregisterMixDeliveryHandler(MixTransportCodec)
-  await self.handlerTasks.cancelAndWait()
-  self.handlerTasks.setLen(0)
-  await self.streamTasks.cancelAndWait()
-  self.streamTasks.setLen(0)
+  let sessions = self.sessions.takeSessions()
+  var shutdownTasks = newSeqOfCap[Future[void].Raising([])](sessions.len)
+  for session in sessions:
+    shutdownTasks.add(session.shutdown())
+  await noCancel shutdownTasks.allFutures()
   self.replyCredentials.clear()
-  self.sessions.clear()
   self.started = false
 ```
 
@@ -1093,11 +848,11 @@ This exchange exercises both directions explicitly. Initiator Data travels throu
 
 The implemented flow bounds memory and carries application bytes in both directions, but it does not yet guarantee recovery from every packet-loss pattern. The following mechanisms remain to be added:
 
-- `pendingOutbound` retains the payload of every unacknowledged Data frame, but the transport does not yet associate a retransmission deadline with those entries. If a Data frame and all of its redundant delivery attempts are lost, no timer currently resubmits the retained payload.
+- Data retransmission currently uses one fixed timeout and retries without a retry-count limit. The transport does not estimate RTT, apply exponential backoff or close a stream after a configured number of unsuccessful retries.
 
 - Receiving duplicate Data causes the receiver to send its latest absolute ACK again, which recovers when the Data arrived but the preceding ACK was lost. If submitting an ACK itself returns an error, `runAcknowledgements` currently exits, so later changes to the receive window no longer produce ACKs on that stream.
 
-- Refill retries continue only while a recipient-side Data or ACK operation is waiting for an unreserved SURB group. The transport does not yet run a background refill task, and it does not proactively send SURBs from the initiator when the recipient has become silent. If retries consume every remaining group before any response arrives, the blocked operation fails because the recipient has no return path through which to request more groups.
+- The implemented pull-only SURB refill can exhaust the recipient's final return paths after repeated loss. [[Mix Transport SURB Replenishment Strategy]] defines the intended hybrid proactive-supply, bounded-credit, supply-retransmission and starvation-recovery design.
 
 - A sender stops allocating new sequences when `nextOutboundSequence` reaches the remote receive-window limit. If the receiver advanced its window but every ACK carrying the new `receiveBase` was lost, the sender has no persist probe: it does not periodically send a small control frame that prompts the receiver to repeat its current window information.
 

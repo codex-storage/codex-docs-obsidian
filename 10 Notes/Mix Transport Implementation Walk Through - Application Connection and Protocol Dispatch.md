@@ -46,7 +46,7 @@ The normal libp2p multistream dispatcher performs the same reservation before in
 
 After registering the inbound stream, the recipient installs the stream's write callback, starts its Data-delivery and ACK tasks, and marks the stream established before submitting `StreamAck`. The first redundant acknowledgement may reach the initiator while the recipient is still sending the remaining copies. Preparing the bounded receive path first ensures that Data sent immediately by the initiator is retained rather than rejected because the recipient stream is still pending.
 
-After at least one `StreamAck` copy has been submitted successfully, the recipient transfers stream and protocol-reservation cleanup to `runProtocolHandler`, starts that handler as an independent asynchronous task, and proactively requests a SURB refill when needed. `handleOpenStream` tracks the handler future in `MixTransport.handlerTasks` and does not wait for the application handler to finish.
+After at least one `StreamAck` copy has been submitted successfully, the recipient transfers stream and protocol-reservation cleanup to `runProtocolHandler`, starts that handler as an independent asynchronous task, and proactively requests a SURB refill when needed. The resulting handler future belongs to the `TransportStream` on which the handler operates. `handleOpenStream` stores that future in `stream.handlerTask` through `setHandlerTask` and does not wait for the application handler to finish. The stream also owns its ordered-delivery and ACK tasks and, when enabled by the transport configuration, its Data retransmission task.
 
 The relevant sequence in `handleOpenStream` is:
 
@@ -58,7 +58,9 @@ if not await self.sendStreamResponse(session, stream.streamId, FrameKind.StreamA
 
 keepStream = true
 keepReservation = true
-self.handlerTasks.trackFut(runProtocolHandler(session, stream, protocol))
+let handlerTask = runProtocolHandler(session, stream, protocol)
+if not handlerTask.finished:
+  stream.setHandlerTask(handlerTask)
 discard await self.requestRefill(session)
 ```
 
@@ -79,15 +81,17 @@ receive later Data
 deliver bytes to stream buffer --------> blocked read resumes
 ```
 
-`runProtocolHandler` awaits the selected handler inside its own task. Awaiting there keeps the protocol reservation and stream alive for exactly as long as the application uses the connection. Its deferred cleanup releases the protocol reservation, removes the stream from its session and closes the buffered connection after the handler returns or is cancelled.
+`runProtocolHandler` awaits the selected handler inside its own task. Awaiting there keeps the protocol reservation and stream alive for exactly as long as the application uses the connection. After the handler returns or is cancelled, deferred cleanup clears `handlerTask` before closing the stream so `closeImpl` does not request cancellation of the task that is currently performing cleanup. Closing the stream requests cancellation of its internal Data-delivery and ACK tasks. The handler then waits for those tasks, releases the protocol reservation and removes the stream from its session.
 
 The handler is obtained through an explicitly typed `LPProtoHandler` binding before it is called. Libp2p's `handler` accessor is a template; binding its result preserves the handler type's `raises: [CancelledError]` contract, whereas calling the overloaded template directly loses that precise effect information.
 
 ## Transport Teardown
 
-`MixTransport.stop` first unregisters the Mix delivery and raw-reply callbacks so no new work can enter. It cancels and waits for all tracked protocol-handler tasks and then for the per-stream delivery and ACK tasks. Cancellation reaches handlers blocked in a connection read. Each handler task's deferred cleanup releases its protocol reservation and closes its stream before the session and reply-credential stores are cleared.
+`MixTransport.stop` first unregisters the Mix delivery and raw-reply callbacks so no new work can enter. `takeSessions` then removes every session from both store indexes without yielding. Each detached session calls `takeStreams`, which removes all of its streams before asynchronous shutdown begins. Stream shutdown closes the buffered connection, requests cancellation of its handler and internal tasks, and waits for those tasks to finish. Cancellation therefore reaches handlers blocked in a connection read as well as ACK or Data-delivery tasks blocked inside a nested asynchronous operation.
 
-Tracking these futures also keeps a live reference to every active handler. Finished tasks are pruned when another task is registered, and the complete list is cleared during transport shutdown.
+Closing a pending session fires its `established` event. Closing a pending stream fires its `resolved` event. A concurrent `connect` or `dial` therefore resumes immediately and reports that the session or stream closed; the caller does not remain blocked until its establishment timeout expires.
+
+The ownership hierarchy now follows the lifetime of the represented objects: `MixTransport` owns sessions, each `TransportSession` owns its registered streams, and each `TransportStream` owns its handler invocation and internal tasks. MixTransport no longer keeps flat transport-wide handler and stream task collections.
 
 ## Component Test
 

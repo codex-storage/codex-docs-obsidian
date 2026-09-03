@@ -11,3 +11,4 @@ related:
 - [[Mix Transport Implementation Walk Through - Stream Establishment Round Trip]]
 - [[Mix Transport Implementation Walk Through - Application Connection and Protocol Dispatch]]
 - [[Mix Transport Implementation Walk Through - Bounded Data Flow]]
+- [[Mix Transport SURB Replenishment Strategy]]
