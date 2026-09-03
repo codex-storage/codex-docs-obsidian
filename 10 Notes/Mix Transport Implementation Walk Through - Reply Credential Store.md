@@ -3,8 +3,10 @@ related:
   - "[[Mix Transport Implementation Walk Through]]"
   - "[[Mix Transport Design Specification]]"
   - "[[Mix Transport Implementation Walk Through - Wire Format Foundation]]"
+  - "[[Mix Transport SURB Replenishment Strategy]]"
+  - "[[Mix Transport Implementation Walk Through - SURB Replenishment]]"
 ---
-This phase adds the initiator-side state needed to receive replies through SURBs and connects it to `MixTransport.handleRawSurbReply`. The store is now used by the `Connect` handshake described in [[Mix Transport Implementation Walk Through - Connect Handshake]].
+This phase adds the initiator-side state needed to receive replies through SURBs and connects the state to `MixTransport.handleRawSurbReply`. The store is used by the `Connect` handshake described in [[Mix Transport Implementation Walk Through - Connect Handshake]] and by every later SURB supplied to the session recipient.
 
 The implementation is in `libp2p_mix_transport/reply_credentials.nim`, with focused tests in `tests/test_reply_credentials.nim`.
 
@@ -12,43 +14,39 @@ The implementation is in `libp2p_mix_transport/reply_credentials.nim`, with focu
 
 When the initiator asks Mix to create a SURB, Mix returns two related values:
 
-- a public `SURB`, which the initiator sends to the destination;
+- a public `SURB`, which the initiator sends to the recipient;
 - a private `ReplyCredential`, which remains on the initiator and is required to recover the eventual reply.
 
-The destination never receives the credential. It only consumes the public SURB when sending a return frame. When the resulting `RawSurbReply` reaches the initiator, its `SURBIdentifier` selects the matching credential.
+The recipient never receives the credential. The recipient stores the public SURB in its session queue and may later select that SURB as part of a temporary redundancy batch for one reverse frame. When the resulting `RawSurbReply` reaches the initiator, its `SURBIdentifier` selects the matching private credential.
 
-Mix understands the cryptographic contents of the credential, but MixTransport owns its lifetime. The credential exists because a transport operation is awaiting a reply, belongs to a transport session, expires according to transport policy, and must be removed together with the redundant credentials created for the same logical reply.
+Mix understands the cryptographic contents of the credential, but MixTransport owns its lifetime. The credential belongs to a transport session, expires according to transport policy and must be removed when its SURB is used or its session ends.
 
-## Redundancy Groups
+## Why Credentials Are Independent
 
-```nim
-ReplyCredentialGroup* = ref object
-  sessionId: PeerId
-  identifiers: HashSet[SURBIdentifier]
-  expiresAt: Moment
-```
+SURBs are supplied and stored individually. The recipient decides which `N` SURBs to combine only when sending a reverse frame. The initiator cannot know that temporary selection in advance, so the reply credential store does not represent redundancy batches.
 
-One return frame may be sent through several redundant SURBs. Each SURB has its own credential and identifier, but all of them represent one logical reply opportunity.
+Recovering one redundant copy consumes only the credential matching that copy. Another copy can still arrive through a different SURB and be recovered with its own credential. The decoded transport frame then suppresses the repeated logical effect: Data has a stream sequence, ACK is an absolute snapshot, handshake responses act only on pending state, and `RefillRequest` carries absolute supply state.
 
-`ReplyCredentialGroup` records that relationship. The `sessionId` tells the future raw-reply path which transport session owns the reply. `identifiers` lets the store remove every redundant credential together. `expiresAt` gives the whole group one lifetime, so a partially expired group cannot be represented.
-
-The group is a `ref object` because every indexed credential must point to the same group identity. Consuming the group through any one entry must affect the group seen through all other entries.
+This model may retain the credential for a lost redundant copy until expiry even after another copy succeeded. The TTL and credential capacity bound that cost. The advantage is that SURBs remain independent throughout supply and storage, and no persistent grouping has to be transmitted or reconstructed.
 
 ## Indexed Entries
+
+Each stored entry contains one credential together with its transport ownership and lifetime:
 
 ```nim
 StoredReplyCredential* = object
   credential*: ReplyCredential
-  group*: ReplyCredentialGroup
+  sessionId*: PeerId
+  expiresAt*: Moment
 ```
 
-The store is indexed by `SURBIdentifier`:
+The store indexes these entries by `SURBIdentifier`:
 
 ```nim
 credentials: Table[SURBIdentifier, StoredReplyCredential]
 ```
 
-A raw reply therefore needs one table lookup to obtain both the opaque Mix credential and the transport group that owns it. The receive path now uses them as follows:
+A raw reply therefore requires one lookup to obtain the opaque Mix credential, the transport session that owns the reply and the credential deadline. The receive path is:
 
 ```text
 RawSurbReply.identifier
@@ -57,90 +55,110 @@ ReplyCredentialStore.get
         ↓
 Mix.recoverReply(stored.credential, rawReply)
         ↓ success
-ReplyCredentialStore.consume(stored.group)
+ReplyCredentialStore.consume(reply.identifier)
         ↓
-dispatch the recovered transport frame to stored.group.sessionId
+dispatch the recovered transport frame to stored.sessionId
 ```
 
-`ReplyCredentialStore.recoverReply` returns `Opt.none` when the identifier is unknown. Before recovery, the transport separately checks whether the identifier is retired. A genuinely unknown identifier produces `RawSurbReplyDisposition.Unhandled`, leaving the reply available to Mix's embedded connection path. A retired identifier belongs to a reply group that this transport already completed or cancelled, so the transport returns `Handled` without recovery or fallback.
+`ReplyCredentialStore.recoverReply` returns `Opt.none` when the identifier is unknown. Before recovery, the transport separately checks whether the identifier is retired. A genuinely unknown identifier produces `RawSurbReplyDisposition.Unhandled`, leaving the reply available to Mix's embedded connection path. A retired identifier belongs to a SURB that this transport already consumed or cancelled, so the transport returns `Handled` without attempting recovery or fallback.
 
-When the identifier is known, the transport owns the reply and returns `Handled` even if recovery fails. A Sphinx recovery failure leaves the group intact because another redundant packet may be valid. If Sphinx recovery succeeds but the recovered Mix payload is malformed, the group is consumed: every redundant SURB carries the same logical payload, so another copy cannot repair its encoding.
+When the identifier is active, the transport owns the reply and returns `Handled` even if recovery fails. A Sphinx recovery failure leaves that credential active because a later packet using the same SURB identifier may be valid. If Sphinx recovery succeeds but the recovered Mix payload is malformed, the matching credential is consumed because another packet using that one-time SURB cannot produce a different plaintext. Other credentials remain independent even if the recipient happened to use their SURBs for redundant copies of the same malformed frame.
 
-## Atomic Group Registration
+## Atomic Registration
+
+`createReplySurbs` creates several public SURBs and collects their private credentials before exposing either collection. It then registers all collected credentials with one call:
 
 ```nim
-store.addGroup(sessionId, credentials)
+self.replyCredentials.add(sessionId, prepared.credentials).isOkOr:
+  return err("could not register reply credentials: " & error)
 ```
 
-`addGroup` validates the complete input before inserting anything. It rejects an empty group, an empty identifier, a duplicate within the new group, an identifier already present as an active credential, an identifier that remains retired from an earlier group, or a group that would exceed the configured capacity. Rejecting an identifier while its tombstone is active prevents the raw reply handler from mistaking a new reply for a late packet from the earlier group.
+The store validates the complete input before inserting anything:
 
-Only after every check succeeds does it create the shared group and insert its credentials. A failed registration therefore cannot leave half a redundancy group in the store.
+```nim
+proc add*(
+    store: ReplyCredentialStore,
+    sessionId: PeerId,
+    credentials: openArray[ReplyCredential],
+    now: Moment = Moment.now(),
+): Result[void, string]
+```
 
-The public SURBs corresponding to these credentials are handled separately by the wire boundary described in [[Mix Transport Implementation Walk Through - Wire Format Foundation]]. `createReplyGroups` registers each private credential group locally and places only the serialized public SURBs in `Connect`, `OpenStream` or `Refill`.
+`add` rejects an empty input, an empty identifier, a duplicate inside the input, an identifier already registered as an active credential, an identifier that remains retired from earlier use or an addition that would exceed the configured capacity. Rejecting an identifier while its tombstone is active prevents the raw reply handler from mistaking a new reply for a repeated packet from the earlier SURB.
+
+Only after every check succeeds does `add` insert the individual entries. Failed registration therefore leaves none of the proposed credentials in the store.
+
+The corresponding public SURBs cross the wire separately, as described in [[Mix Transport Implementation Walk Through - Wire Format Foundation]]. `Connect` carries bootstrap SURBs, `OpenStream` and `SurbStatusProbe` carry response-specific SURBs, and `SurbSupply` carries numbered session supply. None of these frames encodes redundancy-batch membership.
 
 ## Capacity Without Eviction
+
+The store checks the complete proposed addition against its remaining capacity:
 
 ```nim
 if credentials.len > store.maxCredentials - store.credentials.len:
   return err("reply credential store is at capacity")
 ```
 
-The store refuses a new group when it lacks capacity. It does not evict an existing credential because that credential may be the only way to recover an unrelated in-flight reply. The caller can then wait, apply backpressure, or fail the operation without damaging another session.
-
-The subtraction form avoids overflowing an addition such as `currentLen + newLen`.
+The store does not evict an active credential because that credential may be the only way to recover an unrelated reply. The caller can apply backpressure or fail the operation without damaging another session. The subtraction form avoids overflowing an addition such as `currentLen + newLen`.
 
 ## Expiry
 
-Each group receives one deadline when it is registered:
+Every credential receives its own deadline when it is registered:
 
 ```nim
-expiresAt: now + store.ttl
+StoredReplyCredential(
+  credential: credential,
+  sessionId: sessionId,
+  expiresAt: now + store.ttl,
+)
 ```
 
-`get` checks this deadline directly. Once the deadline is reached, the credential is no longer returned even if a cleanup sweep has not physically removed its table entry yet. This separates correctness from cleanup timing: an expired reply cannot be accepted merely because the process has been idle and no sweep has run.
+Credentials registered by the same call currently receive the same deadline because `add` uses one `now` value, but the store does not rely on that equality. Later proactive supply operations can register additional credentials for the same session at different times.
 
-`purgeExpired` performs physical cleanup for active credentials and retired identifiers. It first collects expired entries and then removes them because a Nim `Table` must not be modified while it is being iterated.
+`get` checks the selected credential's deadline directly. Once the deadline is reached, the credential is no longer returned even if a cleanup sweep has not physically removed its table entry. An expired reply therefore cannot be accepted merely because the process has been idle and no sweep has run.
 
-The default TTL is currently thirty minutes, matching the existing Mix credential lifetime while the transport policy is developed. The transport will eventually ensure that this lifetime does not exceed Mix's replay-tag lifetime.
+`purgeExpired` performs physical cleanup for active credentials and retired identifiers. The procedure first collects expired identifiers and then removes them because a Nim `Table` must not be modified while it is being iterated.
 
-## Group Consumption
+The default TTL is thirty minutes, matching the existing Mix credential lifetime while the transport policy is developed. The transport will eventually ensure that this lifetime does not exceed the usable lifetime of the underlying Mix return path.
+
+## Consuming One Credential
+
+Successful recovery calls:
 
 ```nim
-store.consume(group)
+store.consume(reply.identifier)
 ```
 
-After the initiator successfully recovers one reply, `consume` removes every credential in the redundancy group and records each identifier as retired until the group's original expiry time. A later redundant packet therefore remains attributable to the completed group even though its private credential is no longer available. `MixTransport.handleRawSurbReply` detects that retired identifier and returns `Handled` immediately.
+`consume` removes only the selected credential and records its identifier as retired until that credential's original expiry time. A repeated packet using the same SURB therefore remains attributable to the transport even though its private credential is no longer available. `MixTransport.handleRawSurbReply` detects the tombstone and returns `Handled` immediately.
 
-Consumption is idempotent. A redundant reply that was already in flight may reach the receive path after the winning copy, and teardown may race with normal completion. Repeating `consume` in either case is harmless.
+Consumption is idempotent. Repeating `consume` for an identifier that is no longer active leaves the store unchanged. Session teardown can therefore retire an entry without coordinating with normal reply completion.
 
 ## Retired Identifiers
 
-Retired identifiers are short-lived tombstones, not credentials. They contain only a `SURBIdentifier` and the expiry time inherited from the corresponding `ReplyCredentialGroup`. They do not allow another reply to be recovered.
+Retired identifiers are short-lived tombstones, not credentials. A tombstone contains only a `SURBIdentifier` and an expiry time and cannot recover another reply.
 
-`isRetiredIdentifier` is a pure query. It returns true only when the identifier is present and its deadline has not passed; it never deletes an entry. Cleanup happens explicitly through `purgeExpired`, so a caller does not have to expect an `is*` operation to mutate the store.
+`isRetiredIdentifier` is a pure query. The function returns true only when the identifier is present and its deadline has not passed; the function never deletes an entry. Cleanup happens explicitly through `purgeExpired`, so callers do not have to expect an `is*` operation to mutate the store.
 
-The store keeps only a limited number of retired identifiers so that late-reply tracking cannot consume memory without limit. This limit applies only to retired identifiers; active reply credentials have a separate capacity and are never removed to make room for a tombstone.
+The store keeps only a limited number of retired identifiers so that repeated-reply tracking cannot consume memory without limit. This limit applies only to tombstones; active reply credentials have a separate capacity and are never removed to make room for a tombstone.
 
-When the retired-identifier table is full, the store compares the new identifier's expiry time with the expiry times of the identifiers already stored. It keeps the identifiers that will remain valid for the longest time and discards the one whose expiry time comes first. The discarded identifier may therefore be either an existing tombstone or the new identifier. For example, if the new identifier expires sooner than every identifier already stored, the store simply does not add it.
+When the tombstone table is full, the store compares the new identifier's expiry time with the expiry times already stored. The store retains the identifiers that remain valid for the longest time and discards the candidate whose expiry comes first. The discarded candidate may be either an existing tombstone or the new identifier. Evicting a tombstone only removes additional repeated-packet suppression; eviction does not remove a credential needed to recover an outstanding reply.
 
-This policy uses the available capacity for the identifiers that can suppress late packets for the longest remaining period. Evicting a tombstone only removes that additional late-packet suppression; it does not remove a credential needed to recover an outstanding reply.
-
-`removeSession(sessionId)` uses the same retirement rule during cancellation or teardown. It first purges entries that are already expired, then removes the still-active credentials owned by the selected session and retires their identifiers until each group's deadline. Groups belonging to the same transport session need not share a deadline because SURB refill can create them at different times.
+`removeSession(sessionId)` uses the same retirement rule during cancellation or teardown. The procedure first purges entries that are already expired, then removes every still-active credential owned by the selected session and retires each identifier until its individual deadline. Credentials belonging to one session can have different deadlines because bootstrap, stream-opening, numbered-supply and status-probe operations create them at different times.
 
 ## Tests
 
-The tests create real Mix `ReplyCredential` values by generating a minimal one-hop return path and calling `createSURB`. To exercise successful recovery, the helper builds a normal empty-codec Mix reply, pads it to the fixed Sphinx message size with `addPadding`, sends it through the SURB with `useSURB`, processes the return hop, and passes the resulting `RawSurbReply` to the store. Mix does not add fragmentation metadata or a sender-derived sequence number; messages that do not fit in one Sphinx packet are rejected. This avoids constructing an opaque credential or recovered reply by assigning private cryptographic fields.
+The focused tests create real Mix `ReplyCredential` values by generating a minimal one-hop return path and calling `createSURB`. To exercise successful recovery, the helper builds a normal empty-codec Mix reply, pads it to the fixed Sphinx message size with `addPadding`, sends it through the SURB with `useSURB`, processes the return hop and passes the resulting `RawSurbReply` to the store. This path avoids constructing opaque credentials by assigning their private cryptographic fields.
 
 The tests establish the essential behavior:
 
-- consuming the group through one successful reply removes both redundant credentials, retires both identifiers, and can safely be repeated;
-- a full store rejects a new group while preserving the credentials already in flight;
-- retired identifiers are independently bounded, become semantically inactive at their deadline, and remain stored until an explicit purge;
+- consuming one credential leaves other independently registered credentials active;
+- a full store rejects a new atomic addition while preserving active credentials;
+- retired identifiers are independently bounded, become semantically inactive at their deadline and remain stored until an explicit purge;
 - removing one session retires its active identifiers while preserving another session's credentials;
 - an expired credential is invisible before `purgeExpired` removes its table entry;
 - an unknown identifier remains available to Mix's embedded fallback path;
-- a valid reply returns its transport `sessionId` and payload, then consumes the group;
-- Sphinx corruption retains the group for another redundant copy;
-- a cryptographically recovered but malformed Mix payload consumes the group.
+- every successfully recovered redundant copy consumes only its matching credential;
+- Sphinx corruption retains the matching credential for a potentially valid later packet;
+- a cryptographically recovered but malformed Mix payload consumes only the matching credential.
 
-`MixTransport` owns one `ReplyCredentialStore`, clears it during shutdown, and uses it from its registered raw-reply callback. Recovered bytes are decoded as a `MixTransportFrame`, and the frame's `sessionId` must match the session recorded by the credential group before the frame is dispatched to the live session.
+`MixTransport` owns one `ReplyCredentialStore`, clears the store during shutdown and uses it from the registered raw-reply callback. Recovered bytes are decoded as a `MixTransportFrame`, and the frame's `sessionId` must match `StoredReplyCredential.sessionId` before the frame is dispatched to the live session.

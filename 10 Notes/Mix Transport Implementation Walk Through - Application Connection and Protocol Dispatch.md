@@ -46,14 +46,20 @@ The normal libp2p multistream dispatcher performs the same reservation before in
 
 After registering the inbound stream, the recipient installs the stream's write callback, starts its Data-delivery and ACK tasks, and marks the stream established before submitting `StreamAck`. The first redundant acknowledgement may reach the initiator while the recipient is still sending the remaining copies. Preparing the bounded receive path first ensures that Data sent immediately by the initiator is retained rather than rejected because the recipient stream is still pending.
 
-After at least one `StreamAck` copy has been submitted successfully, the recipient transfers stream and protocol-reservation cleanup to `runProtocolHandler`, starts that handler as an independent asynchronous task, and proactively requests a SURB refill when needed. The resulting handler future belongs to the `TransportStream` on which the handler operates. `handleOpenStream` stores that future in `stream.handlerTask` through `setHandlerTask` and does not wait for the application handler to finish. The stream also owns its ordered-delivery and ACK tasks and, when enabled by the transport configuration, its Data retransmission task.
+After at least one `StreamAck` copy has been submitted successfully, the recipient transfers stream and protocol-reservation cleanup to `runProtocolHandler` and starts that handler as an independent asynchronous task. The resulting handler future belongs to the `TransportStream` on which the handler operates. `handleOpenStream` stores that future in `stream.handlerTask` through `setHandlerTask` and does not wait for the application handler to finish. The stream also owns its ordered-delivery and ACK tasks and, when enabled by the transport configuration, its Data retransmission task.
+
+The `handlerTask.finished` check handles synchronous completion rather than concurrent pre-emption. A Nim asynchronous procedure begins executing when called and can return an already-finished future when none of its awaited futures suspend. In that case `runProtocolHandler` has already performed its deferred cleanup and `TransportStream` must not retain the completed future as an active handler task.
+
+After starting the application handler, `handleOpenStream` calls `requestRefill`. This call checks the recipient's current SURB queue and sends an urgent `RefillRequest` only when the queue is below its protected level and the refill retry deadline permits another request. With proactive replenishment enabled, the initiator's supplier normally restores the queue without waiting for this request; the request remains the pull part of the hybrid strategy.
 
 The relevant sequence in `handleOpenStream` is:
 
 ```nim
 self.configureStream(session, stream)
 stream.establish()
-if not await self.sendStreamResponse(session, stream.streamId, FrameKind.StreamAck):
+if not await self.sendStreamResponse(
+  session, move(replyBatch), stream.streamId, FrameKind.StreamAck
+):
   return
 
 keepStream = true

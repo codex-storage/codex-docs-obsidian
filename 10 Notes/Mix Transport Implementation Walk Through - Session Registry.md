@@ -3,8 +3,10 @@ related:
   - "[[Mix Transport Implementation Walk Through]]"
   - "[[Mix Transport Design Specification]]"
   - "[[Mix Transport Implementation Walk Through - Reply Credential Store]]"
+  - "[[Mix Transport SURB Replenishment Strategy]]"
+  - "[[Mix Transport Implementation Walk Through - SURB Replenishment]]"
 ---
-This note describes the transport-owned registry used by the implemented `Connect` handshake, stream registry, received-SURB supply and refill state. `SessionStore` provides both the frame-routing lookup by pseudonym and the `connect(destination)` reuse lookup by real destination.
+This note describes the transport-owned registry used by the `Connect` handshake, virtual streams and session-level SURB supply. `SessionStore` provides both the frame-routing lookup by pseudonym and the `connect(destination)` reuse lookup by real destination.
 
 The implementation is in `libp2p_mix_transport/sessions.nim`. Its focused tests are in `tests/test_sessions.nim`.
 
@@ -40,7 +42,7 @@ Every session records a role and an establishment state:
 
 ```nim
 SessionRole = Initiator | Recipient
-SessionState = Pending | Established
+SessionState = Pending | Established | Closed
 ```
 
 The role records which endpoint created the local session state. An initiator session was created by the endpoint that started the handshake. A recipient session was created by the endpoint that received the corresponding `Connect` frame.
@@ -58,19 +60,30 @@ TransportSession* = ref object
   role: SessionRole
   state: SessionState
   established: AsyncEvent
-  receivedSurbGroups: Deque[seq[SURB]]
+  receivedSurbs: Deque[SURB]
+  recipientSurbCapacity: int
+  surbSupplyInitialized: bool
+  surbSupplyReceiveBase: SurbSupplySequence
+  surbSupplyAcknowledgementBitmap: seq[byte]
+  surbSupplyLimit: SurbSupplySequence
   replyCapacityStateChanged: AsyncEvent
   replySendLock: AsyncLock
   nextRefillRequestAt: Opt[Moment]
-  outstandingRefillRequests: Table[RefillRequestId, Moment]
-  nextRefillRequestId: Opt[RefillRequestId]
-  refillResponseLifetime: Duration
-  maxOutstandingRefillRequests: int
+  remoteSurbSupplyReceiveBase: SurbSupplySequence
+  remoteSurbSupplyLimit: SurbSupplySequence
+  nextSurbSupplySequence: Opt[SurbSupplySequence]
+  pendingSurbSupply: Table[SurbSupplySequence, PendingSurbSupply]
+  surbSupplyRequested: bool
+  surbSupplyStateChanged: AsyncEvent
+  surbSupplierTask: Future[void].Raising([CancelledError])
+  nextSurbStatusProbeAt: Opt[Moment]
   streams: Table[StreamId, TransportStream]
   nextOutboundStreamId: Opt[StreamId]
 ```
 
-The `established` event is how `connect` waits for `ConnectAck` without polling. The received-SURB queue and refill fields belong here because reply capacity is shared by all reverse traffic in the session, rather than by one virtual stream. `nextRefillRequestAt` prevents the recipient from spending another reserved group before the previously submitted request has had time to produce a response. `outstandingRefillRequests` has a separate purpose: it records the individual request identifiers whose responses can still be accepted, including identifiers from earlier attempts that may produce valid late responses. The stream table routes a frame carrying `streamId` after the session has first been selected by `sessionId`.
+The `established` event is how `connect` waits for `ConnectAck` without polling. The recipient-side fields store a bounded queue of public SURBs, a receive base and bitmap that suppress duplicate numbered supply, and an absolute supply limit that grants replacement credit when the recipient consumes a SURB. `nextRefillRequestAt` prevents the recipient from spending another reserved redundancy batch before the preceding urgent request has had time to produce useful supply.
+
+The initiator-side fields record the recipient's latest supply snapshot, the next unused supply sequence, retained public serializations awaiting acknowledgement and the task that creates or retransmits supply. `surbSupplyRequested` is the boolean urgency condition set by `RefillRequest`; repeated requests do not create correlated request objects. The stream table routes a frame carrying `streamId` after the session has first been selected by `sessionId`.
 
 ## How Sessions Are Found
 
@@ -124,14 +137,15 @@ let session = TransportSession(
   role: SessionRole.Initiator,
   state: SessionState.Pending,
   established: newAsyncEvent(),
-  receivedSurbGroups: initDeque[seq[SURB]](),
+  receivedSurbs: initDeque[SURB](),
+  recipientSurbCapacity: store.recipientSurbCapacity,
+  surbSupplyAcknowledgementBitmap: newSeq[byte](SurbSupplyAckBitmapBytes),
   replyCapacityStateChanged: newAsyncEvent(),
   replySendLock: newAsyncLock(),
   nextRefillRequestAt: Opt.none(Moment),
-  outstandingRefillRequests: initTable[RefillRequestId, Moment](),
-  nextRefillRequestId: Opt.some(RefillRequestId(1)),
-  refillResponseLifetime: store.refillResponseLifetime,
-  maxOutstandingRefillRequests: store.maxOutstandingRefillRequests,
+  nextSurbSupplySequence: Opt.some(SurbSupplySequence(0)),
+  pendingSurbSupply: initTable[SurbSupplySequence, PendingSurbSupply](),
+  surbSupplyStateChanged: newAsyncEvent(),
   streams: initTable[StreamId, TransportStream](),
   nextOutboundStreamId: Opt.some(StreamId(1)),
 )
@@ -153,7 +167,7 @@ When it finds an initiator session, it removes the entry from `bySessionId` and 
 
 Calling `remove` again with the same `sessionId` is harmless: the first call has already removed the session, so the second call returns `none`.
 
-`MixTransport` owns one `SessionStore`. A current `TransportSession` also owns its stream table, received SURB groups, refill-cycle state, bounded response-correlation table, reply-capacity event and per-session reply-send lock. Per-stream retransmission payloads live in each `TransportStream`. During shutdown, `stop` first cancels handler and flow tasks, then clears the reply credential and session stores. Coordinated runtime session teardown is still incomplete because the disconnect and reset frames are not handled yet.
+`MixTransport` owns one `SessionStore`. A current `TransportSession` owns its stream table, individual received SURBs, numbered supply state, supplier task, reply-capacity event and per-session reply-send lock. Per-stream Data retransmission payloads and tasks live in each `TransportStream`. During shutdown, `stop` detaches the sessions and waits for each session to cancel its supplier and shut down its streams before clearing reply credentials. Coordinated runtime session teardown is still incomplete because the disconnect and reset frames are not handled yet.
 
 ## What the Tests Demonstrate
 
@@ -165,13 +179,13 @@ The third test first registers an initiator session. It then tries to reuse that
 
 The fourth test removes an initiator session by its `sessionId`. It verifies that the session disappears from both tables and that repeating the removal returns `none` without changing any other state.
 
-The refill tests exercise state that is also owned by the session. One test schedules the next permitted request, accepts a response that leaves the supply at the low-water mark and verifies that another request becomes due immediately. A second test registers two request attempts, accepts the later response before the delayed earlier response and verifies that both responses add their groups while repeating either response identifier is rejected. Another test configures a two-entry response-correlation table, registers three requests with increasing deadlines and verifies that the first request is removed while the two newer requests remain acceptable. These tests demonstrate that request scheduling is independent from response acceptance, late responses are useful exactly once and bounding the correlation table does not terminate the session.
+The supply tests exercise state that is also owned by the session. The recipient test initializes a six-SURB capacity, accepts numbered SURBs out of order, verifies that a duplicate does not enter the queue twice and checks that consuming two SURBs advances the absolute supply limit by exactly two. The initiator test applies a snapshot, registers supply up to its credit, acknowledges a contiguous prefix and one later bitmap position, and verifies that only the missing serialization remains pending. A retransmission test schedules deadlines, takes the earliest due serialization and verifies that a later snapshot removes retained entries even when they have retry deadlines.
 
 ## How the Handshake Uses the Registry
 
 The implemented `Connect` handshake now uses these operations directly. The initiating MixTransport generates a fresh session pseudonym and calls `addInitiatorSession(destination, sessionId)` before sending `Connect`. Keeping the session in `Pending` state gives the returning `ConnectAck` handler a stable object to find through the `sessionId` carried by the acknowledgement.
 
-The recipient's `Connect` handler reads the pseudonym from the frame and calls `addRecipientSession(sessionId)`. It attaches the public SURB groups received from the initiator, prepares `ConnectAck` and marks the recipient session established before sending the first redundant acknowledgement copy. The initiator can therefore act on an acknowledgement without racing the recipient's state transition.
+The recipient's `Connect` handler reads the pseudonym from the frame and calls `addRecipientSession(sessionId)`. It decodes each public SURB independently, stores the valid SURBs in the session queue, prepares `ConnectAck` and marks the recipient session established before sending the first redundant acknowledgement copy. The initiator can therefore act on an acknowledgement without racing the recipient's state transition.
 
 The relevant order is:
 
@@ -183,20 +197,31 @@ defer:
   if not keepSession:
     discard self.sessions.remove(frame.sessionId)
 
-session.addReceivedSurbGroups(decodedGroups).isOkOr:
+session.addReceivedSurbs(decodedSurbs).isOkOr:
   return
 
-var replyGroup = session.takeReceivedSurbGroup().valueOr:
+var replyBatch = session.takeReceivedSurbs(DefaultReplySurbRedundancy).valueOr:
+  return
+
+session.initializeSurbSupply().isOkOr:
+  return
+var acknowledgement = MixTransportFrame(
+  version: MixTransportVersion,
+  sessionId: frame.sessionId,
+  kind: FrameKind.ConnectAck,
+)
+session.attachSurbSupplySnapshot(acknowledgement)
+let payload = acknowledgement.encode().valueOr:
   return
 
 session.establish()
-(await self.sendWithSurbGroup(replyGroup, acknowledgement)).isOkOr:
+(await self.sendWithSurbRedundancyBatch(replyBatch, payload)).isOkOr:
   return
 keepSession = true
 ```
 
-This order matters because `sendWithSurbGroup` awaits the redundant sends sequentially. The first copy may reach the initiator while the recipient is still submitting the remaining copies. Establishing the recipient session first guarantees that an immediate `OpenStream` or Data frame is not discarded as traffic for a pending session.
+This order matters because `sendWithSurbRedundancyBatch` awaits the redundant sends sequentially. The first copy may reach the initiator while the recipient is still submitting the remaining copies. Establishing the recipient session first guarantees that an immediate `OpenStream` or Data frame is not discarded as traffic for a pending session.
 
-If every copy fails, `sendWithSurbGroup` returns an error and the deferred cleanup removes the session. If cancellation interrupts acknowledgement submission, the same cleanup removes the session because cancellation explicitly ends the local handshake, regardless of whether an earlier copy escaped. If submission completes with at least one successful copy, `keepSession` preserves the established state needed to process the traffic that the acknowledgement authorized.
+If every copy fails, `sendWithSurbRedundancyBatch` returns an error and the deferred cleanup removes the session. If cancellation interrupts acknowledgement submission, the same cleanup removes the session because cancellation explicitly ends the local handshake, regardless of whether an earlier copy escaped. If submission completes with at least one successful copy, `keepSession` preserves the established state needed to process the traffic that the acknowledgement authorized.
 
-When the initiator recovers and validates `ConnectAck`, it looks up the pending session by `sessionId` and marks that same object established. A later `connect(destination)` call finds it through `byDestination` and returns the existing session instead of starting another handshake. The complete exchange is described in [[Mix Transport Implementation Walk Through - Connect Handshake]].
+When the initiator recovers and validates `ConnectAck`, it looks up the pending session by `sessionId`, applies the initial supply snapshot, marks that same object established and starts its supplier task. A later `connect(destination)` call finds the session through `byDestination` and returns the existing object instead of starting another handshake. The complete exchange is described in [[Mix Transport Implementation Walk Through - Connect Handshake]], and the session-owned supply state is described in [[Mix Transport Implementation Walk Through - SURB Replenishment]].

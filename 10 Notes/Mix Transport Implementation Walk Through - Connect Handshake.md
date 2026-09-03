@@ -5,6 +5,8 @@ related:
   - "[[Mix Transport Implementation Walk Through - Wire Format Foundation]]"
   - "[[Mix Transport Implementation Walk Through - Reply Credential Store]]"
   - "[[Mix Transport Implementation Walk Through - Session Registry]]"
+  - "[[Mix Transport SURB Replenishment Strategy]]"
+  - "[[Mix Transport Implementation Walk Through - SURB Replenishment]]"
 ---
 This phase implements the first complete exchange between two MixTransport endpoints. The initiator sends `Connect` anonymously through the Mix network, the recipient replies through a SURB supplied in that frame, and the initiator establishes the session only after recovering a valid `ConnectAck`.
 
@@ -32,21 +34,19 @@ Before sending anything, the initiator checks `SessionStore` for an existing ses
 
 For a new destination, the initiator generates a random `PeerId` to use as `sessionId` and adds a pending initiator session to the registry. It then asks its local `MixProtocol` to create the public SURBs and private reply credentials carried by the handshake.
 
-The current defaults create two reply groups with two redundant SURBs in each group:
+The current default creates four independent reply SURBs:
 
 ```text
 Connect
-  reply group 1
-    SURB 1A
-    SURB 1B
-  reply group 2
-    SURB 2A
-    SURB 2B
+  SURB 1
+  SURB 2
+  SURB 3
+  SURB 4
 ```
 
-The public SURBs are serialized into the `Connect` frame. Their four private `ReplyCredential` values remain on the initiator and are registered in `ReplyCredentialStore` under the new `sessionId`. Each pair of credentials is registered as a separate redundancy group because the two public SURBs in that pair represent two delivery attempts for the same logical reply.
+The public SURBs are serialized separately into the `Connect` frame. Their four private `ReplyCredential` values remain on the initiator and are registered independently in `ReplyCredentialStore` under the new `sessionId`. The frame does not prescribe which SURBs will carry the same logical reply.
 
-The recipient requires at least two groups before accepting `Connect`. The first group is reserved for `ConnectAck`, so accepting only one group would establish a recipient session with no remaining way to send the next return frame. The wire decoder permits any non-empty group list because it validates the general frame structure; the recipient applies the stricter session policy when it handles `Connect`.
+The recipient requires at least four valid SURBs before accepting `Connect`. It removes two SURBs to form the temporary redundancy batch used for `ConnectAck`; the remaining two provide one further control-frame batch. The wire decoder permits any non-empty SURB list because it validates the general frame structure. The recipient independently deserializes each value and applies the stricter minimum to the number of valid SURBs before creating the session.
 
 After the frame passes wire validation and Protobuf encoding, the initiator calls:
 
@@ -63,39 +63,44 @@ The recipient's MixProtocol recognizes `MixTransportCodec` and passes the decode
 MixTransport decodes the Protobuf frame and handles it as a new session only when its kind is `Connect`. It then performs the following operations in order:
 
 1. It checks that no local session already uses the received `sessionId`.
-2. It deserializes every public SURB in every reply group. If any group cannot be decoded, it rejects the complete frame without creating a session.
-3. It creates a pending recipient session identified by the received pseudonym.
-4. It moves all decoded reply groups into that session.
-5. It removes the first complete reply group from the session, marks the recipient session established, and uses that group to send `ConnectAck`.
+2. It deserializes every public SURB independently and ignores malformed values.
+3. It verifies that at least four valid SURBs remain.
+4. It creates a pending recipient session identified by the received pseudonym.
+5. It moves all valid SURBs into that session's queue.
+6. It removes two SURBs to form the `ConnectAck` redundancy batch.
+7. It initializes numbered supply accounting from the two bootstrap SURBs still in the queue and attaches the resulting absolute supply snapshot to `ConnectAck`.
+8. It marks the recipient session established and sends `ConnectAck` through the temporary redundancy batch.
 
-The session stores complete groups rather than individual SURBs. One outgoing transport frame consumes one group, and every SURB within that group carries a redundant copy of the same frame. Treating the group as one unit prevents a SURB intended as redundancy for one logical reply from being reassigned to a different reply.
+The session stores individual SURBs. Redundancy is assigned only when a reverse frame is ready to send, so the same queue can serve all stream and session traffic without persistent group boundaries.
 
-## Sending ConnectAck Through the First Reply Group
+## Sending ConnectAck Through a Temporary Redundancy Batch
 
-The recipient encodes a `ConnectAck` containing the same `sessionId` and no SURB groups or application payload. It submits the encoded bytes separately through every SURB removed from the first reply group:
+The recipient encodes a `ConnectAck` containing the same `sessionId`, no public SURBs or application payload, and the first absolute SURB supply snapshot. With the default recipient capacity of sixteen, the two bootstrap SURBs remaining in the queue leave fourteen empty positions. The snapshot therefore advertises `surbSupplyReceiveBase = 0`, an empty 256-bit acknowledgement bitmap and `surbSupplyLimit = 14`.
+
+The recipient submits the encoded bytes separately through both SURBs in the temporary batch:
 
 ```text
-ConnectAck bytes -> SURB 1A -> return Mix path
-                 -> SURB 1B -> return Mix path
+ConnectAck bytes -> SURB 1 -> return Mix path
+                 -> SURB 2 -> return Mix path
 ```
 
-Each call to `MixProtocol.sendWithSurb` consumes the supplied SURB, even if that send reports an error. The helper therefore tries every SURB in the group and considers the group submitted when at least one call succeeds. If every call fails, the recipient removes the newly created session because no acknowledgement was published.
+Each call to `MixProtocol.sendWithSurb` consumes the supplied SURB, even if that send reports an error. `sendWithSurbRedundancyBatch` therefore tries every SURB in the temporary batch and considers the logical acknowledgement submitted when at least one call succeeds. If every call fails, the recipient removes the newly created session because no acknowledgement was published.
 
 The recipient marks its local session established before submitting the first redundant acknowledgement. This ordering is required because the first copy can reach the initiator while the recipient is still awaiting later sends. Once the initiator observes `ConnectAck`, it may immediately send `OpenStream` or Data; the recipient must already accept that session traffic. Complete acknowledgement failure removes the session. Cancellation also removes it because cancellation explicitly terminates the local handshake, regardless of whether an earlier copy escaped.
 
-The second reply group remains available to carry later control traffic. `OpenStream` supplies additional groups, and the implemented refill policy preserves two control groups before ordinary reverse Data or ACK traffic may proceed.
+The other two bootstrap SURBs remain available for one later control-frame redundancy batch. After the initiator recovers `ConnectAck`, its session supplier uses the advertised limit to send fourteen numbered SURBs and fill the recipient's default sixteen-SURB capacity. `OpenStream` supplies its own two response paths, which the recipient uses directly for `StreamAck` or `StreamReject` rather than inserting them into this numbered session supply.
 
 ## Recovering ConnectAck on the Initiator
 
 Each redundant acknowledgement returns to the initiator as a `RawSurbReply`. Before Mix attempts its embedded request/reply handling, it offers that reply to the raw reply handler registered by MixTransport.
 
-`ReplyCredentialStore` uses the reply's `SURBIdentifier` to find the corresponding private credential and its redundancy group. A successful cryptographic recovery produces the encoded `ConnectAck` bytes and the `sessionId` recorded when that credential group was registered.
+`ReplyCredentialStore` uses the reply's `SURBIdentifier` to find the corresponding private credential. A successful cryptographic recovery produces the encoded `ConnectAck` bytes and the `sessionId` recorded with that individual credential.
 
 MixTransport then decodes the transport frame and verifies that the `sessionId` inside the frame matches the `sessionId` associated with the private credential. This prevents a recovered reply registered for one transport session from being dispatched to another session merely because its payload names a different pseudonym.
 
-The reply path accepts `ConnectAck` only when the matching local session exists, has the `Initiator` role, and is still `Pending`. It then calls `establish`, which changes the state to `Established` and fires the session's `AsyncEvent`. The `connect` call waiting on that event can now return the established session to its caller.
+The reply path first applies the complete supply snapshot. The reply path then accepts `ConnectAck` only when the matching local session exists, has the `Initiator` role, and is still `Pending`. It calls `establish`, which changes the state to `Established` and fires the session's `AsyncEvent`, and starts the session-owned SURB supplier task. The `connect` call waiting on the event can now return the established session to its caller while the supplier fills the advertised credit through the forward Mix path.
 
-When the first valid redundant acknowledgement is recovered, `ReplyCredentialStore` removes both credentials belonging to that reply group and records both identifiers as retired until the group's original expiry time. If the second acknowledgement arrives later, MixTransport recognizes its identifier as belonging to a completed reply group and returns `Handled` without attempting cryptographic recovery or offering it to Mix's embedded reply path. The credentials for the second, unused reply group remain active because the recipient still owns the matching public SURBs.
+When a valid acknowledgement is recovered, `ReplyCredentialStore` removes only the matching credential and records that SURB identifier as retired until its original expiry time. If the second acknowledgement arrives, the store recovers it independently and consumes its own credential. `handleReplyFrame` observes that the session is no longer pending and ignores the repeated logical `ConnectAck`. Credentials corresponding to the two bootstrap SURBs still held by the recipient remain active.
 
 ## Keeping Ordinary Deliveries and SURB Replies Separate
 
@@ -103,7 +108,7 @@ The two frame paths deliberately have different dispatch functions.
 
 `Connect` is accepted only by the ordinary Mix delivery handler. `ConnectAck` is accepted only after the raw SURB reply has been recovered with a credential owned by MixTransport. A payload sent as an ordinary forward Mix message therefore cannot mark an initiator session established merely by declaring itself to be `ConnectAck`.
 
-The implemented stream and flow frames follow the same directional rule. Forward `OpenStream`, Data and Refill frames enter through ordinary Mix delivery. Return `ConnectAck`, `StreamAck`, `StreamReject`, Data, ACK and `RefillRequest` frames enter the initiator through raw SURB reply recovery.
+The implemented stream and supply frames follow the same directional rule. Forward `OpenStream`, Data, `SurbSupply` and `SurbStatusProbe` frames enter through ordinary Mix delivery. Return `ConnectAck`, `StreamAck`, `StreamReject`, Data, ACK, `RefillRequest` and `SurbStatus` frames enter the initiator through raw SURB reply recovery.
 
 ## Timeout, Cancellation, and Cleanup
 
@@ -111,13 +116,13 @@ The initiator currently waits up to thirty seconds for its session's establishme
 
 If SURB creation, credential registration, frame encoding, Mix submission, or the acknowledgement wait fails, `connect` removes the pending session and removes every reply credential registered under its `sessionId`. Cancellation propagates as `CancelledError`, but the same deferred cleanup runs before it leaves the operation. This prevents a failed handshake from occupying the destination lookup or leaving credentials that no live session can consume.
 
-`removeSession(sessionId)` in `ReplyCredentialStore` first purges all entries whose reply-group deadline has passed. It then removes the still-active credentials belonging to the failed session and retires their identifiers until their original group deadlines. Credentials owned by other active sessions remain registered. A session can own groups with different deadlines because later SURB refills will create new groups at different times.
+`removeSession(sessionId)` in `ReplyCredentialStore` first purges all entries whose individual deadline has passed. It then removes the still-active credentials belonging to the failed session and retires their identifiers until their original deadlines. Credentials owned by other active sessions remain registered. One session can own credentials with different deadlines because numbered supply and later status probes create them at different times.
 
-The recipient similarly removes its new session if it cannot decode the supplied groups, install them, encode `ConnectAck`, or submit the acknowledgement through at least one SURB. The recipient establishes the local state before publication, but complete acknowledgement failure is still a definite rollback condition because no initiator could have acted on the acknowledgement.
+The recipient similarly removes its new session if it receives too few valid SURBs, cannot store them, cannot encode `ConnectAck` or cannot submit the acknowledgement through at least one selected SURB. The recipient establishes the local state before publication, but complete acknowledgement failure is still a definite rollback condition because no initiator could have acted on the acknowledgement.
 
 ## Current Behavior When Packets Are Lost
 
-The acknowledgement has two redundant delivery attempts because the recipient sends it through both SURBs in the first group. The `Connect` frame itself is currently submitted once. If the forward packet is lost, or if both redundant acknowledgements are lost, the initiator reaches its connect timeout and removes the pending session and its credentials.
+The acknowledgement has two redundant delivery attempts because the recipient forms a temporary batch containing two SURBs. The `Connect` frame itself is currently submitted once. If the forward packet is lost, or if both redundant acknowledgements are lost, the initiator reaches its connect timeout and removes the pending session and its credentials.
 
 This phase does not retransmit `Connect`. Adding retransmission requires duplicate `Connect` handling on the recipient: a repeated frame for the same pending or established `sessionId` must cause another acknowledgement without creating another session. That behavior should be implemented together so retransmission cannot create duplicate recipient state.
 
@@ -142,4 +147,4 @@ initiator MixTransport
   -> pending session becomes established
 ```
 
-The test verifies that the returned session has the initiator role, is established, and exposes the real destination as its consumer-facing `peerId`. It then calls `connect` again with the same destination and verifies that MixTransport returns the identical `TransportSession` rather than generating a new pseudonym or sending another handshake. The test also observes both raw acknowledgement replies and waits until MixTransport has classified each one as `Handled`. This gives the test a deterministic teardown point and verifies that the late redundant acknowledgement is suppressed by its retired identifier.
+The test verifies that the returned session has the initiator role, is established and exposes the real destination as its consumer-facing `peerId`. It then calls `connect` again with the same destination and verifies that MixTransport returns the identical `TransportSession` rather than generating a new pseudonym or sending another handshake. Before opening a stream, the default-policy test waits until proactive numbered supply fills the recipient's advertised capacity. The test also observes redundant raw replies and verifies that each independent credential recovers its copy while only the first copy of a logical acknowledgement changes session or stream state.

@@ -84,7 +84,7 @@ func isValidInboundStreamId(session: TransportSession, streamId: uint64): bool =
 
 An initiator allocates odd outbound IDs itself, so it accepts even IDs in incoming `OpenStream` frames. A recipient allocates even outbound IDs itself, so it accepts odd incoming IDs. The modulo test does not claim that every identifier with the expected parity already exists; `addInboundStream` creates the stream only after also checking the session state, codec and duplicate table entry.
 
-After validation, the session creates a pending inbound stream with the exact `streamId` supplied by the opener. The recipient's `OpenStream` handler establishes it only after registering the stream and successfully submitting `StreamAck` through a SURB reply group.
+After validation, the session creates a pending inbound stream with the exact `streamId` supplied by the opener. The recipient's `OpenStream` handler configures and establishes the stream before submitting `StreamAck` through the temporary redundancy batch supplied directly by that `OpenStream` frame. The early state change allows the recipient to accept Data that may arrive after the initiator receives the first redundant acknowledgement but before the recipient finishes submitting the remaining acknowledgement copy. If every `StreamAck` submission fails, the handler removes and shuts down the new stream.
 
 ```nim
 if not session.isValidInboundStreamId(streamId):

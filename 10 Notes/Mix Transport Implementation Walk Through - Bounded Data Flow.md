@@ -5,17 +5,18 @@ related:
   - "[[Mix Transport Implementation Walk Through - Application Connection and Protocol Dispatch]]"
   - "[[Mix Transport Implementation Walk Through - Reply Credential Store]]"
   - "[[Mix Transport SURB Replenishment Strategy]]"
+  - "[[Mix Transport Implementation Walk Through - SURB Replenishment]]"
 ---
-This walkthrough follows application bytes through an established `TransportStream`. The forward path begins when the session initiator writes to the stream, divides the byte sequence into Sphinx-sized transport frames and sends those frames to the session recipient. The recipient restores the ordered byte stream, exposes the bytes to the mounted libp2p protocol and acknowledges the received sequences. The walkthrough then follows the reverse path, where the recipient sends Data and ACK frames through SURB groups supplied by the initiator. Because every reverse frame consumes one group, the recipient must replenish that supply before it loses its final return path.
+This walkthrough follows application bytes through an established `TransportStream`. The forward path begins when the session initiator writes to the stream, divides the byte sequence into Sphinx-sized transport frames and sends those frames to the session recipient. The recipient restores the ordered byte stream, exposes the bytes to the mounted libp2p protocol and acknowledges the received sequences. The walkthrough then follows the reverse path, where the recipient forms a temporary redundancy batch from individual SURBs supplied by the initiator and sends the same Data or ACK frame through every SURB in that batch. Because every reverse frame consumes a fixed number of one-shot SURBs, the recipient must replenish its supply before it loses its final return path.
 
 The implementation is divided across four modules:
 
-- `wire.nim` defines the `Data`, `Ack`, `RefillRequest` and `Refill` frames. The module also defines the fixed-width stream and sequence types, derives one maximum Data payload size and validates the fixed-size acknowledgement bitmap.
+- `wire.nim` defines `Data`, `Ack` and the SURB supply snapshot carried by reverse frames. The module also defines the fixed-width stream and sequence types, derives one maximum Data payload size and validates both fixed-size acknowledgement bitmaps.
 - `streams.nim` owns sequence numbers, retained outbound chunks, the receive window, its bitmap and the events used by the flow tasks.
-- `sessions.nim` owns the recipient's SURB groups, refill state and the lock that serializes return sends within one session.
+- `sessions.nim` owns the recipient's bounded queue of individual SURBs, numbered supply state, refill timing and the lock that serializes return sends within one session.
 - `transport.nim` connects the standard libp2p `Connection` methods to those state machines. The module selects forward Mix delivery for frames sent by the session initiator and SURB delivery for frames sent by the session recipient.
 
-The current implementation bounds memory, propagates application backpressure, retransmits unacknowledged Data and retries a SURB refill while the recipient still has a group with which to send another request. Data retransmission is enabled by default and can be disabled when constructing `MixTransport`. The transport does not yet probe a stalled receive window when every ACK carrying the advanced window has been lost.
+The current implementation bounds memory, propagates application backpressure, retransmits unacknowledged Data and replenishes recipient SURBs through a hybrid proactive and request-driven mechanism. Data retransmission and proactive SURB replenishment are enabled by default and can be disabled independently when constructing `MixTransport`. The transport does not yet probe a stalled Data receive window when every ACK carrying the advanced window has been lost.
 
 ## The State Behind One Virtual Connection
 
@@ -212,23 +213,29 @@ If the remote base is `20`, its 256-position window admits sequences `20` throug
 type
   StreamId* = uint32
   SequenceNumber* = uint32
+  SurbSupplySequence* = uint32
 
 const MaxDataSequenceNumber* = SequenceNumber.high - 1
 ```
 
-The frame encodes stream IDs, Data sequence numbers and ACK receive bases as Protobuf `fixed32` fields:
+The frame encodes stream IDs, Data sequence numbers, ACK receive bases and SURB supply sequence values as Protobuf `fixed32` fields:
 
 ```nim
 streamId* {.fieldNumber: 4, fixed.}: Opt[StreamId]
 sequence* {.fieldNumber: 5, fixed.}: Opt[SequenceNumber]
 receiveBase* {.fieldNumber: 8, fixed.}: Opt[SequenceNumber]
+firstSurbSequence* {.fieldNumber: 10, fixed.}: Opt[SurbSupplySequence]
+surbSupplyReceiveBase* {.fieldNumber: 11, fixed.}: Opt[SurbSupplySequence]
+surbSupplyLimit* {.fieldNumber: 13, fixed.}: Opt[SurbSupplySequence]
 ```
 
 Each fixed numeric field occupies four value bytes regardless of the current identifier or sequence. Consequently, a stream that has just opened and a stream approaching sequence exhaustion use the same Data payload bound. The transport can calculate one payload bound for every Data frame; it does not need to encode candidate frames repeatedly to determine how many application bytes fit at a particular stream or sequence number.
 
 The remaining variable-size Data field is `sessionId`. `connect` generates session pseudonyms with `PeerId.random`, which currently produces a 39-byte binary Peer ID. `MaxSessionIdBytes` records that wire constraint, and both session registration and frame validation reject a longer identifier.
 
-`MaxDataFrameOverheadBytes` accounts for the Protobuf tags and encoded values of `version`, the maximum-size `sessionId`, `kind`, `streamId`, `sequence` and the payload length prefix. `MaxDataPayloadBytes` subtracts that overhead from the Sphinx payload space available after Mix service framing:
+`MaxDataFrameOverheadBytes` accounts for the Protobuf tags and encoded values of `version`, the maximum-size `sessionId`, `kind`, `streamId`, `sequence`, the payload length prefix and the complete SURB supply snapshot. The snapshot is included because Data sent from the session recipient reports its latest supply receipt and credit. Data sent from the initiator does not carry the snapshot, but using one conservative payload bound in both directions keeps chunking independent of session role.
+
+`MaxDataPayloadBytes` subtracts that overhead from the Sphinx payload space available after Mix service framing:
 
 ```nim
 const
@@ -245,17 +252,24 @@ const
   FrameKindFieldBytes = ProtobufFieldTagBytes + SingleByteVarintBytes
   StreamIdFieldBytes = ProtobufFieldTagBytes + sizeof(StreamId)
   SequenceFieldBytes = ProtobufFieldTagBytes + sizeof(SequenceNumber)
-  DataPayloadHeaderBytes =
-    ProtobufFieldTagBytes + MaxDataPayloadLengthPrefixBytes
+  DataPayloadHeaderBytes = ProtobufFieldTagBytes + MaxDataPayloadLengthPrefixBytes
+  SurbSupplyReceiveBaseFieldBytes =
+    ProtobufFieldTagBytes + sizeof(SurbSupplySequence)
+  SurbSupplyAckBitmapFieldBytes =
+    ProtobufFieldTagBytes + SingleByteVarintBytes + SurbSupplyAckBitmapBytes
+  SurbSupplyLimitFieldBytes =
+    ProtobufFieldTagBytes + sizeof(SurbSupplySequence)
 
   MaxDataFrameOverheadBytes =
     VersionFieldBytes + SessionIdFieldBytes + FrameKindFieldBytes +
-    StreamIdFieldBytes + SequenceFieldBytes + DataPayloadHeaderBytes
+    StreamIdFieldBytes + SequenceFieldBytes + DataPayloadHeaderBytes +
+    SurbSupplyReceiveBaseFieldBytes + SurbSupplyAckBitmapFieldBytes +
+    SurbSupplyLimitFieldBytes
 
 let MaxDataPayloadBytes* = MaxTransportFrameBytes - MaxDataFrameOverheadBytes
 ```
 
-The expression uses `sizeof(StreamId)` and `sizeof(SequenceNumber)` rather than hard-coded numeric widths. Changing either alias and retaining fixed-width Protobuf encoding therefore updates the calculated payload bound automatically. The frame validator independently rejects a larger payload, and `encode` retains the final complete-frame size check. The wire-format test encodes `MaxDataPayloadBytes` with both the smallest identifiers and the largest valid identifiers, verifies that both frames exactly reach `MaxTransportFrameBytes`, and verifies that one additional payload byte is rejected. This test makes a future frame-layout change fail visibly if the remaining overhead expression is not updated.
+The expression uses `sizeof(StreamId)`, `sizeof(SequenceNumber)` and `sizeof(SurbSupplySequence)` rather than hard-coded numeric widths. Changing an alias and retaining fixed-width Protobuf encoding therefore updates the calculated payload bound automatically. The frame validator independently rejects a larger payload, and `encode` retains the final complete-frame size check. The wire-format test verifies that the small and largest identifiers produce the same length, that recipient Data carrying a complete supply snapshot reaches `MaxTransportFrameBytes`, and that one additional payload byte is rejected. This test makes a future frame-layout change fail visibly if the overhead expression is not updated.
 
 ## 4. A Sequence Is Assigned and the Chunk Is Retained
 
@@ -337,17 +351,16 @@ Submission does not mean that the remote endpoint received the Data. The chunk r
 
 `sendStreamFrame` is the common submission procedure for an already constructed `MixTransportFrame`. The procedure is not specific to Data frames. `writeStream` passes the `Data` frame constructed in Section 4 to `sendStreamFrame`. The `runAcknowledgements` task described in Section 10 uses the same procedure for each `Ack` frame. Centralizing this decision ensures that Data and ACK traffic follow the same delivery rule for a given session role.
 
-`sendStreamFrame` first encodes the complete transport frame. The local variable `payload` therefore contains an encoded `MixTransportFrame`; `payload` does not necessarily contain application Data. The session role then selects how that encoded frame reaches the other endpoint:
+`sendStreamFrame` selects the delivery path from the session role. The initiator encodes the frame and sends it through the ordinary forward Mix path. The recipient first selects a temporary SURB redundancy batch, attaches the current SURB supply snapshot, and then encodes the resulting frame for reverse delivery:
 
 ```nim
 proc sendStreamFrame(
     self: MixTransport, session: TransportSession, frame: MixTransportFrame
 ): Future[Result[void, string]] {.async: (raises: [CancelledError]).} =
-  let payload = frame.encode().valueOr:
-    return err("could not encode " & $frame.kind & " frame: " & error)
-
   case session.role
   of SessionRole.Initiator:
+    let payload = frame.encode().valueOr:
+      return err("could not encode " & $frame.kind & " frame: " & error)
     let destination = session.destination.valueOr:
       return err("initiator session has no destination")
     (
@@ -360,11 +373,15 @@ proc sendStreamFrame(
     await session.acquireReplySend()
     defer:
       session.releaseReplySend()
-    (await self.ensureUnreservedSurbGroup(session)).isOkOr:
+    (await self.ensureUnreservedSurbs(session)).isOkOr:
       return err(error)
-    var replyGroup = session.takeUnreservedSurbGroup().valueOr:
+    var replyBatch = session.takeUnreservedSurbs(DefaultReplySurbRedundancy).valueOr:
       return err(error)
-    (await self.sendWithSurbGroup(replyGroup, payload)).isOkOr:
+    var replyFrame = frame
+    session.attachSurbSupplySnapshot(replyFrame)
+    let payload = replyFrame.encode().valueOr:
+      return err("could not encode " & $frame.kind & " frame: " & error)
+    (await self.sendWithSurbRedundancyBatch(replyBatch, payload)).isOkOr:
       return err("could not send " & $frame.kind & " frame: " & error)
     (await self.requestRefill(session)).isOkOr:
       return err(error)
@@ -373,17 +390,17 @@ proc sendStreamFrame(
 
 When the local endpoint is the session initiator, the initiator knows the destination and submits the encoded frame through the forward Mix path. This path carries both Data written by the initiator and ACKs produced after the initiator receives reverse Data from the recipient.
 
-When the local endpoint is the session recipient, the recipient does not have a forward destination for the anonymous initiator. The recipient submits the encoded frame through a SURB group supplied by the initiator. This path carries both response Data written by the recipient's application handler and ACKs produced after the recipient receives forward Data from the initiator.
+When the local endpoint is the session recipient, the recipient does not have a forward destination for the anonymous initiator. The recipient removes `DefaultReplySurbRedundancy` individual SURBs from the session queue, treats those SURBs as a temporary redundancy batch, and submits the same encoded frame through every SURB in that batch. This path carries both response Data written by the recipient's application handler and ACKs produced after the recipient receives forward Data from the initiator.
 
-`acquireReplySend` serializes all return sends belonging to the same session. The session has one shared supply of received SURB groups, so an application response and an ACK task must not concurrently inspect and consume that supply. The recipient preserves a control reserve, waits for an unreserved group before sending ordinary traffic, and checks whether another refill should be requested after consuming the selected group.
+`acquireReplySend` serializes all return sends belonging to the same session. The session has one shared queue of individual SURBs, so an application response and an ACK task must not concurrently inspect and consume that queue. The recipient preserves enough individual SURBs for control traffic, waits until a complete temporary batch is available above that reserve, and checks whether another refill should be requested after consuming the selected SURBs. Removing SURBs increases the absolute supply limit; attaching the snapshot to the frame reports that replacement credit to the initiator.
 
-The definitions of an unreserved group, the existing pull-based refill sequence, and the intended hybrid replenishment mechanism are documented in [[Mix Transport SURB Replenishment Strategy]]. This walkthrough relies on their resulting contract: one reverse transport frame consumes one session-owned redundancy group, and Data or ACK transmission waits rather than consuming capacity protected for replenishment control.
+The definition of unreserved SURBs and the hybrid replenishment mechanism are documented in [[Mix Transport SURB Replenishment Strategy]] and mapped to code in [[Mix Transport Implementation Walk Through - SURB Replenishment]]. This walkthrough relies on their resulting contract: one reverse transport frame consumes `DefaultReplySurbRedundancy` session-owned SURBs, and Data or ACK transmission waits rather than consuming SURBs protected for replenishment control.
 
-After the session recipient submits the same encoded frame through every SURB in the selected group, the explanation moves to the session initiator that receives those redundant replies. The initiator's reply credential store contains the private credentials corresponding to that SURB group. When the initiator successfully recovers the first reply, the store consumes the complete credential group because every SURB in the group carries a redundant copy of the same transport frame. If another copy arrives later, its retired SURB identifier tells the initiator that the group has already produced a valid reply, so the later copy does not enter the transport state machine again.
+After the session recipient submits the same encoded frame through every SURB in the temporary batch, the explanation moves to the session initiator that receives those redundant replies. The initiator's reply credential store contains one private credential for each SURB. Each arriving reply is recovered independently and consumes only its matching credential. Multiple recovered replies may therefore contain the same logical Data or ACK frame. Data sequence numbers and absolute ACK state make those frames idempotent: the first copy changes stream state, while later copies are recognized as duplicates and cannot deliver application bytes or remove outbound chunks twice.
 
 ## 6. Both Receive Paths Converge on `handleData`
 
-Forward frames arrive through the registered Mix service handler and `handleDelivery`. SURB replies are recovered by `handleRawSurbReply`, decoded, checked against the credential group's session ID and passed to `handleReplyFrame`.
+Forward frames arrive through the registered Mix service handler and `handleDelivery`. SURB replies are recovered by `handleRawSurbReply`, decoded, checked against the session ID stored with the matching individual credential and passed to `handleReplyFrame`.
 
 Both paths converge on `handleData`:
 
@@ -443,7 +460,7 @@ proc receiveData*(
 
 A sequence below the base was already delivered in order. A set bit identifies a duplicate still inside the window. In both duplicate cases, the sender may be retrying because the previous ACK was lost, so the receiver signals `shouldSendAck` and sends its current snapshot again.
 
-An above-window sequence cannot be produced by a compliant sender because the sender limits new sequences using the latest `remoteReceiveBase` reported by the receiver. The receiver classifies such a sequence as `OutsideWindow`, discards its payload and does not signal `shouldSendAck`. This prevents an invalid frame from causing unnecessary ACK traffic. If the receiver is the session recipient, sending that ACK would consume a SURB group. If the receiver is the session initiator, sending that ACK would consume a forward Mix delivery.
+An above-window sequence cannot be produced by a compliant sender because the sender limits new sequences using the latest `remoteReceiveBase` reported by the receiver. The receiver classifies such a sequence as `OutsideWindow`, discards its payload and does not signal `shouldSendAck`. This prevents an invalid frame from causing unnecessary ACK traffic. If the receiver is the session recipient, sending that ACK would consume a temporary batch of SURBs. If the receiver is the session initiator, sending that ACK would consume a forward Mix delivery.
 
 An accepted payload is inserted into `pendingInbound` and its acknowledgement-bitmap bit is set. If the chunk at `receiveBase` has not arrived, the receiver may still retain chunks with higher sequence numbers that arrived first. Those out-of-order chunks remain in `pendingInbound` until the missing earlier chunk arrives and ordered delivery can continue. The receiver accepts an out-of-order chunk only when its sequence number is lower than `receiveBase + ReceiveWindowChunks`, so every retained chunk remains inside the fixed receive window.
 
@@ -674,9 +691,11 @@ proc newMixTransport*(
     streamOpenTimeout = DefaultStreamOpenTimeout,
     refillRequestTimeout = DefaultRefillRequestTimeout,
     dataRetransmissionTimeout = DefaultDataRetransmissionTimeout,
+    surbSupplyRetransmissionTimeout = DefaultSurbSupplyRetransmissionTimeout,
+    surbStatusProbeInterval = DefaultSurbStatusProbeInterval,
     enableDataRetransmissions = true,
-    refillResponseLifetime = DefaultRefillResponseLifetime,
-    maxOutstandingRefillRequests = DefaultMaxOutstandingRefillRequests,
+    enableProactiveSurbReplenishment = true,
+    recipientSurbCapacity = DefaultRecipientSurbCapacity,
 ): MixTransport
 ```
 
@@ -833,7 +852,7 @@ await requests.put(request)
 await stream.writeLp(TestResponse)
 ```
 
-The response is divided into transport Data frames and sent from the recipient through SURB groups. The initiator reorders those frames, feeds the reconstructed bytes into its `BufferStream`, and completes the pending `readLp`:
+The response is divided into transport Data frames. For each frame, the recipient forms a temporary redundancy batch from its queue of individual SURBs and sends the frame through every SURB in that batch. The initiator reorders the recovered frames, feeds the reconstructed bytes into its `BufferStream`, and completes the pending `readLp`:
 
 ```nim
 let receivedResponseFuture = initiatorStream.readLp(1024)
@@ -842,7 +861,7 @@ if not await receivedResponseFuture.withTimeout(TestOperationTimeout):
 let receivedResponse = await receivedResponseFuture
 ```
 
-This exchange exercises both directions explicitly. Initiator Data travels through forward Mix delivery, and the recipient returns its ACK through a SURB group. Recipient Data travels through SURB groups, and the initiator returns its ACK through forward Mix delivery. The same exchange exercises ordered delivery at both endpoints, the recipient's control reserve and a one-frame refill exchange. `TestOperationTimeout` is a test failure guard for operations that never complete; successful synchronization comes from transport handshakes, queue notifications and stream reads rather than fixed sleeps.
+This exchange exercises both directions explicitly. Initiator Data travels through forward Mix delivery, and the recipient returns its ACK through a temporary batch of individual SURBs. Recipient Data travels through another temporary SURB batch, and the initiator returns its ACK through forward Mix delivery. The default-policy run waits for proactive numbered supply to fill the recipient's advertised capacity. A second run disables proactive supply; the recipient then sends `RefillRequest`, and that urgent signal causes the initiator's supplier task to restore enough return capacity for the same application request and response to complete. `TestOperationTimeout` is a failure guard for operations that never complete; successful synchronization comes from transport handshakes, queue notifications and stream reads rather than fixed sleeps.
 
 ## Remaining Reliability Work
 
@@ -851,8 +870,6 @@ The implemented flow bounds memory and carries application bytes in both directi
 - Data retransmission currently uses one fixed timeout and retries without a retry-count limit. The transport does not estimate RTT, apply exponential backoff or close a stream after a configured number of unsuccessful retries.
 
 - Receiving duplicate Data causes the receiver to send its latest absolute ACK again, which recovers when the Data arrived but the preceding ACK was lost. If submitting an ACK itself returns an error, `runAcknowledgements` currently exits, so later changes to the receive window no longer produce ACKs on that stream.
-
-- The implemented pull-only SURB refill can exhaust the recipient's final return paths after repeated loss. [[Mix Transport SURB Replenishment Strategy]] defines the intended hybrid proactive-supply, bounded-credit, supply-retransmission and starvation-recovery design.
 
 - A sender stops allocating new sequences when `nextOutboundSequence` reaches the remote receive-window limit. If the receiver advanced its window but every ACK carrying the new `receiveBase` was lost, the sender has no persist probe: it does not periodically send a small control frame that prompts the receiver to repeat its current window information.
 

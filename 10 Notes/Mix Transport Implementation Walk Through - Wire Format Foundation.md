@@ -4,6 +4,8 @@ related:
   - "[[Mix Transport Design Specification]]"
   - "[[Mix Transport - Pluggable Integration Model]]"
   - "[[Mix Transport Implementation Walk Through - Bounded Data Flow]]"
+  - "[[Mix Transport SURB Replenishment Strategy]]"
+  - "[[Mix Transport Implementation Walk Through - SURB Replenishment]]"
 ---
 `libp2p_mix_transport/wire.nim` defines the Protobuf envelope exchanged by two MixTransport endpoints. The file is not merely a collection of data types: it is the boundary that rejects malformed combinations of fields before transport state is changed, converts public SURBs through Mix's canonical serialization API and calculates how much application data fits in one Sphinx packet.
 
@@ -44,6 +46,9 @@ FrameKind* {.pure.} = enum
   Disconnect = 11
   ResetSession = 12
   StreamReject = 13
+  SurbSupply = 14
+  SurbStatusProbe = 15
+  SurbStatus = 16
 ```
 
 The numeric values are explicit wire assignments. Existing values must not change if the enum is reordered, and a removed value must not be reused for another meaning.
@@ -55,9 +60,11 @@ The implementation currently handles:
 | `Connect`, `ConnectAck` | Establish and confirm a long-lived transport session |
 | `OpenStream`, `StreamAck`, `StreamReject` | Open or reject one virtual application stream |
 | `Data`, `Ack` | Carry ordered bytes and absolute receive-window state |
-| `RefillRequest`, `Refill` | Replenish recipient-owned SURB groups |
+| `RefillRequest` | Report absolute SURB supply state and request urgent replenishment |
+| `SurbSupply` | Carry consecutively numbered individual public SURBs |
+| `SurbStatusProbe`, `SurbStatus` | Recover supply-state synchronization when the recipient's ordinary SURB queue can be empty |
 
-`CloseStream`, `ResetStream`, `Disconnect` and `ResetSession` reserve the intended wire values, but their end-to-end state transitions are not implemented yet.
+`Refill` reserves the value used by the superseded request/response refill protocol. `CloseStream`, `ResetStream`, `Disconnect` and `ResetSession` also reserve wire values, but their end-to-end state transitions are not implemented yet.
 
 ## The Common Envelope
 
@@ -72,9 +79,11 @@ MixTransportFrame* {.proto2.} = object
   codec* {.fieldNumber: 7.}: Opt[string]
   receiveBase* {.fieldNumber: 8, fixed.}: Opt[SequenceNumber]
   acknowledgementBitmap* {.fieldNumber: 9.}: Opt[seq[byte]]
-  refillRequestId* {.fieldNumber: 10, pint.}: Opt[RefillRequestId]
-  requestedGroups* {.fieldNumber: 11, pint.}: Opt[uint32]
-  surbGroups* {.fieldNumber: 14.}: seq[SurbGroup]
+  firstSurbSequence* {.fieldNumber: 10, fixed.}: Opt[SurbSupplySequence]
+  surbSupplyReceiveBase* {.fieldNumber: 11, fixed.}: Opt[SurbSupplySequence]
+  surbSupplyAcknowledgementBitmap* {.fieldNumber: 12.}: Opt[seq[byte]]
+  surbSupplyLimit* {.fieldNumber: 13, fixed.}: Opt[SurbSupplySequence]
+  surbs* {.fieldNumber: 14.}: seq[seq[byte]]
   rejectionReason* {.fieldNumber: 15.}: Opt[string]
 ```
 
@@ -88,11 +97,10 @@ Every frame carries `version`, `sessionId` and `kind`. `sessionId` is the initia
 | `sequence`, `payload` | `Data` |
 | `codec` | `OpenStream` |
 | `receiveBase`, `acknowledgementBitmap` | `Ack` |
-| `refillRequestId` | `RefillRequest`, `Refill` |
-| `requestedGroups` | `RefillRequest` |
-| `surbGroups` | `Refill` |
+| `firstSurbSequence` | `SurbSupply` |
+| `surbSupplyReceiveBase`, `surbSupplyAcknowledgementBitmap`, `surbSupplyLimit` | complete snapshots on `ConnectAck`, `StreamAck`, `StreamReject`, reverse `Data`, reverse `Ack`, `RefillRequest` and `SurbStatus` |
 | `rejectionReason` | optionally `StreamReject` |
-| `surbGroups` | also `Connect` and optionally `OpenStream` |
+| `surbs` | `Connect`, `OpenStream`, `SurbSupply` and `SurbStatusProbe` |
 
 ## Data and Absolute Acknowledgement State
 
@@ -139,67 +147,58 @@ Every sequence below `receiveBase` has entered the receiver's ordered `BufferStr
 
 The sender-side 64-chunk in-flight limit is separate from the 256-position receive window. It bounds retained retransmission state without changing what one ACK can describe.
 
-## Public SURB Groups
+## Individual Public SURBs
+
+The common frame carries every public SURB as a separate repeated byte field:
 
 ```nim
-SurbGroup* {.proto2.} = object
-  surbs* {.fieldNumber: 1.}: seq[seq[byte]]
+surbs* {.fieldNumber: 14.}: seq[seq[byte]]
 ```
 
-One `SurbGroup` represents redundant delivery attempts for one logical reply. The recipient sends the same payload through every SURB in the group; the initiator consumes the corresponding credential group after the first successful recovery.
+The wire format does not record redundancy membership. The recipient stores every decoded SURB in one session queue and selects several SURBs only when it forms a temporary redundancy batch for one reverse frame. [[Mix Transport SURB Replenishment Strategy]] explains why redundancy is a send-time operation rather than persistent wire state.
 
-The wire layer treats each SURB as opaque bytes and uses Mix's canonical conversion functions:
+The sender converts each public SURB with `serializeSurb`. The receiver applies `deserializeSurb` independently to every repeated value. An invalid serialized SURB can therefore be discarded without rejecting valid SURBs carried by the same transport frame.
 
-```nim
-proc init*(T: type SurbGroup, surbs: openArray[SURB]): Result[T, string] =
-  require surbs.len > 0, "SURB groups must not be empty"
+MixTransport does not reconstruct private SURB fields manually. Local encoding checks that each value has `SurbSize`, and both encoding and decoding bound the total number of repeated values. Inbound structural validation deliberately leaves individual deserialization to the frame handler so one malformed SURB does not invalidate the remaining supply.
 
-  var encoded = newSeqOfCap[seq[byte]](surbs.len)
-  for surb in surbs:
-    encoded.add(surb.serializeSurb())
-  ok(T(surbs: encoded))
-```
+## Numbered SURB Supply and Absolute State
 
-```nim
-proc decodeSurbs*(group: SurbGroup): Result[seq[SURB], string] =
-  require group.surbs.len > 0, "SURB groups must not be empty"
-
-  var decoded = newSeqOfCap[SURB](group.surbs.len)
-  for encoded in group.surbs:
-    let surb = encoded.deserializeSurb().valueOr:
-      return err("could not deserialize SURB: " & error)
-    decoded.add(surb)
-  ok(decoded)
-```
-
-MixTransport does not reconstruct private SURB fields. Validation checks that each serialized value has `SurbSize`, groups are non-empty and the aggregate count cannot exceed the transport-frame capacity.
-
-## The Current One-Packet Refill Contract
-
-`RefillRequest` carries `refillRequestId` and `requestedGroups`. `refillRequestId` identifies one request and allows the recipient to process its response at most once. Validation limits the number of requested groups:
-
-```nim
-of FrameKind.RefillRequest:
-  require frame.requestedGroups.get() > 0, "refill must request at least one group"
-  require frame.requestedGroups.get() <= MaxRefillGroupsPerFrame,
-    "refill requests too many groups"
-```
-
-`MaxRefillGroupsPerFrame` is currently two. The recipient never requests more groups than can fit in one Sphinx packet. If the session still needs more reply capacity after processing the response, the recipient sends another request.
-
-The initiator copies the request identifier into the one returned `Refill` frame:
+After session establishment, the initiator supplies public SURBs in `SurbSupply` frames. `firstSurbSequence` identifies the first repeated SURB, and each later item has the next consecutive sequence:
 
 ```nim
 MixTransportFrame(
   version: MixTransportVersion,
   sessionId: session.sessionId,
-  kind: FrameKind.Refill,
-  refillRequestId: frame.refillRequestId,
-  surbGroups: prepared.encoded,
+  kind: FrameKind.SurbSupply,
+  firstSurbSequence: Opt.some(firstSequence),
+  surbs: encodedSurbs,
 )
 ```
 
-The recipient does not accumulate multipart refills. The response either fits in one Sphinx packet or the recipient asks for fewer groups. The removed `partIndex` and `partCount` fields therefore represented no implemented behavior.
+`MaxSurbSupplyPerFrame` is four. This is a packet-size bound rather than a persistent redundancy-group size: the recipient decodes and accepts every repeated SURB independently. The `SurbSupply` validator also checks that the complete consecutive range remains inside the valid supply sequence space.
+
+The recipient reports supply receipt and replacement credit with one complete snapshot:
+
+```nim
+surbSupplyReceiveBase* {.fieldNumber: 11, fixed.}: Opt[SurbSupplySequence]
+surbSupplyAcknowledgementBitmap* {.fieldNumber: 12.}: Opt[seq[byte]]
+surbSupplyLimit* {.fieldNumber: 13, fixed.}: Opt[SurbSupplySequence]
+```
+
+`surbSupplyReceiveBase` is the first supply sequence whose receipt is not part of the contiguous acknowledged prefix. Bitmap bit `i` reports receipt of `surbSupplyReceiveBase + i`, allowing later sequences to be acknowledged across a gap. `surbSupplyLimit` is the exclusive absolute upper bound for new sequences the initiator may introduce.
+
+All three snapshot fields must be present together. `ConnectAck`, `RefillRequest` and `SurbStatus` require a snapshot. Recipient-originated `StreamAck`, `StreamReject`, Data and ACK frames also carry a snapshot when the transport sends them through the reverse path. A duplicate `RefillRequest` repeats absolute state and only marks replenishment as urgent; the wire protocol therefore needs neither a request identifier nor a requested quantity.
+
+The supply bitmap is tied to its receive window in the same way as the Data acknowledgement bitmap:
+
+```nim
+const
+  SurbSupplyWindow* = 256
+  SurbSupplyAckBitmapBytes* = SurbSupplyWindow div 8
+  MaxSurbSupplyPerFrame* = 4
+```
+
+`SurbStatusProbe` carries fresh, unnumbered SURBs dedicated to one status response. `SurbStatus` returns the absolute snapshot through those SURBs. The dedicated response paths allow a recipient whose normal session queue is empty to report newly available credit.
 
 ## Stream Rejection Is Diagnostic, Not Enumerated
 
@@ -228,12 +227,15 @@ require frame.sequence.isSome == (frame.kind == FrameKind.Data),
   "sequence does not match the frame kind"
 require frame.receiveBase.isSome == (frame.kind == FrameKind.Ack),
   "receiveBase does not match the frame kind"
-require frame.refillRequestId.isSome ==
-  (frame.kind in {FrameKind.RefillRequest, FrameKind.Refill}),
-  "refillRequestId does not match the frame kind"
+require frame.firstSurbSequence.isSome == (frame.kind == FrameKind.SurbSupply),
+  "firstSurbSequence does not match the frame kind"
+require frame.surbSupplyReceiveBase.isSome == carriesSurbSupplyState and
+  frame.surbSupplyAcknowledgementBitmap.isSome == carriesSurbSupplyState and
+  frame.surbSupplyLimit.isSome == carriesSurbSupplyState,
+  "SURB supply state is incomplete"
 ```
 
-For example, `Data` without `sequence` is rejected, and `ConnectAck` carrying `sequence` is also rejected. The same pattern covers payload, codec, ACK state, refill metadata and rejection reason.
+For example, `Data` without `sequence` is rejected, and `ConnectAck` carrying a Data sequence is also rejected. The same pattern covers payload, codec, Data ACK state, SURB supply state and rejection reason.
 
 The bitmap has one exact legal size:
 
@@ -243,7 +245,7 @@ require frame.acknowledgementBitmap.isNone or
   "acknowledgement bitmap has the wrong size"
 ```
 
-Kind-specific checks then reject empty Data, an empty Connect SURB supply, an empty OpenStream codec and invalid refill indices.
+Kind-specific checks then reject empty Data, an empty Connect bootstrap supply, an empty OpenStream codec, an empty or oversized numbered supply, an overflowing supply sequence range and a status probe without response SURBs.
 
 ## Encoding and Decoding
 
@@ -272,13 +274,15 @@ frame.validate().isOkOr:
 ok(frame)
 ```
 
-After `decode` returns `ok`, transport handlers may safely call required accessors such as `frame.streamId.get()` for a stream frame because validation already proved that the field is present.
+After `decode` returns `ok`, transport handlers may safely call required accessors such as `frame.streamId.get()` for a stream frame because validation already proved that the field is present. Inbound decoding validates the number of repeated SURBs but deliberately postpones validation of each serialized SURB value to the frame handler. That separation lets `handleSurbSupply` keep valid values when another value in the same frame is malformed.
 
-## Payload-Aware Data Chunking
+## Fixed Data Payload Capacity
 
-`dataPayloadCapacity(sessionId, streamId, sequence)` uses the actual identifiers to find the largest encodable Data payload by binary search. This matters because the varint lengths of `streamId` and `sequence` and the binary size of `PeerId` contribute to the Protobuf envelope.
+`StreamId`, Data `SequenceNumber`, the Data ACK receive base and `SurbSupplySequence` use fixed-width Protobuf encoding. The session identifier is bounded to the 39-byte representation generated by `PeerId.random`. The transport can therefore calculate one maximum Data-frame overhead without encoding candidate frames.
 
-The chunker therefore asks the wire layer for each sequence instead of subtracting a fixed guessed header length. See [[Mix Transport Implementation Walk Through - Bounded Data Flow]] for the full write path.
+The overhead includes the complete fixed-size SURB supply snapshot because recipient-originated Data carries that snapshot. Initiator-originated Data does not need the snapshot, but using the same `MaxDataPayloadBytes` in both directions keeps chunking independent of the sender's session role.
+
+`MaxDataPayloadBytes` subtracts this named overhead from `MaxTransportFrameBytes`. The final encoder still checks the complete serialized length, so the calculated bound and the actual Sphinx capacity are enforced independently. See [[Mix Transport Implementation Walk Through - Bounded Data Flow]] for the complete write path.
 
 ## Tests
 
@@ -286,10 +290,11 @@ The chunker therefore asks the wire layer for each sequence instead of subtracti
 
 - Data preserves session, stream, sequence and payload across a Protobuf round trip.
 - ACK preserves `receiveBase` and the fixed bitmap, while a 31-byte bitmap is rejected when 32 bytes are required.
-- Refill preserves its batch metadata and grouped public SURBs.
-- `SurbGroup.init` and `decodeSurbs` agree with Mix's canonical serialization.
+- Numbered supply preserves its first sequence and individual public SURBs.
+- A supply snapshot preserves its fixed receive base, 32-byte bitmap and absolute limit, while an incomplete or incorrectly sized snapshot is rejected.
+- Individual SURBs agree with Mix's canonical `serializeSurb` and `deserializeSurb` boundary.
 - Fields that contradict `kind` are rejected.
 - Stream rejection preserves its diagnostic reason and also permits the defined no-reason fallback case.
 - Unsupported versions, oversized frames, malformed Protobuf and incomplete Protobuf are rejected.
 
-The live component test creates cryptographically valid SURBs and exercises Data, ACK and refill through the real five-node Mix path. The wire unit tests stay focused on the serialization and validation boundary.
+The live component test creates cryptographically valid SURBs and exercises proactive supply, recipient-requested supply, Data and ACK through a real five-node Mix path. The wire unit tests stay focused on the serialization and validation boundary.
